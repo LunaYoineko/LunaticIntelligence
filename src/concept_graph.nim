@@ -142,7 +142,8 @@ proc buildFromCorpus*(graph: var ConceptGraph; corpus: seq[string]) =
       var allAscii = true
       for ch in word:
         if ch.int32 > 127: allAscii = false
-      if allAscii: return false
+      # 日本語の短い助詞のみフィルタ（英語は許可）
+      if allAscii and runeCount == 1: return false
     return true
 
   # コーパスから直接単語を抽出（BPEトークンではなく）
@@ -155,17 +156,33 @@ proc buildFromCorpus*(graph: var ConceptGraph; corpus: seq[string]) =
   proc extractJapaneseWords(text: string): seq[string] =
     result = @[]
     var current = ""
+    var isAlpha = false
     for rune in text.toRunes:
       let cp = rune.int32
       # CJK文字（日本語）
       if (cp >= 0x3040 and cp <= 0x309F) or
          (cp >= 0x30A0 and cp <= 0x30FF) or
          (cp >= 0x4E00 and cp <= 0x9FFF):
+        if current.len > 0 and isAlpha:
+          result.add(current)
+          current = ""
+          isAlpha = false
         current.add($rune)
+      # 英語（アルファベット＋数字）
+      elif (cp >= 0x0041 and cp <= 0x005A) or
+           (cp >= 0x0061 and cp <= 0x007A) or
+           (cp >= 0x0030 and cp <= 0x0039) or
+           cp == 0x005F:  # アンダースコア
+        if current.len > 0 and not isAlpha:
+          result.add(current)
+          current = ""
+        current.add($rune)
+        isAlpha = true
       else:
         if current.len > 0:
           result.add(current)
           current = ""
+          isAlpha = false
     if current.len > 0:
       result.add(current)
 
@@ -210,7 +227,7 @@ proc buildFromCorpus*(graph: var ConceptGraph; corpus: seq[string]) =
       echo "    " & $(i+1) & "/" & $corpus.len
 
   # 頻出単語をノードとして追加（閾値: コーパスサイズに応じて調整）
-  let minFreq = max(3, corpus.len div 5000)
+  let minFreq = max(1, min(3, corpus.len div 100))
   var sortedWords: seq[(string, int)]
   for (word, freq) in wordFreq.pairs:
     if freq >= minFreq:

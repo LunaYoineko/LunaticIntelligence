@@ -59,50 +59,90 @@ proc main() =
 
   let mode = getEnv("MODE", "chat")
   let dbPath = getEnv("DB", "luna_cognitive.db")
+  let debugMode = paramCount() >= 1 and paramStr(1) == "--debug"
 
   if mode == "observe":
     # === 観察モード ===
     echo "=== Observe Mode: Corpus Learning ==="
 
     let dataPath = getEnv("OBSERVE_DATA", "ollama_2000.txt")
-    let corpus = loadTrainingData(dataPath)
-    if corpus.len == 0:
-      echo "No data found in: " & dataPath
+    if not fileExists(dataPath):
+      echo "Data not found: " & dataPath
       quit(1)
 
-    echo "Corpus: " & $corpus.len & " conversations"
+    # 大規模コーパスはストリーミング処理
+    let fileSize = getFileSize(dataPath)
+    let useStreaming = fileSize > 100_000_000  # 100MB以上
 
-    # トカナイザ構築（サブセットで学習）
-    let tokCorpus = if corpus.len > 5000: corpus[0..<5000] else: corpus
-    var tok = buildTokenizer(tokCorpus, 4096)
-    echo "Tokenizer: " & $tok.vocab.len & " vocab"
+    if useStreaming:
+      echo "Large corpus detected (" & $(fileSize div 1_000_000) & "MB), using streaming mode"
 
-    # 認知状態初期化
-    var cfg = CognitiveConfig(
-      wmCapacity: 7, spreadSteps: 3, spreadDecay: 0.5,
-      activationThreshold: 0.1, tmClauses: 64, tmThreshold: 0.3,
-      tmSParam: 3.0, halfLifeDays: 7.0, maxEpisodes: 5000, topKEpisodes: 3,
-      thinkingEnabled: true, evalEnabled: true,
-      rewardRate: 0.05, punishRate: 0.03
-    )
-    var state = initCognitiveState(cfg)
-    state.tokenizer = tok
+      # 認知状態初期化
+      var cfg = CognitiveConfig(
+        wmCapacity: 7, spreadSteps: 3, spreadDecay: 0.5,
+        activationThreshold: 0.1, tmClauses: 64, tmThreshold: 0.3,
+        tmSParam: 3.0, halfLifeDays: 7.0, maxEpisodes: 5000, topKEpisodes: 3,
+        thinkingEnabled: true, evalEnabled: true,
+        rewardRate: 0.05, punishRate: 0.03
+      )
+      var state = initCognitiveState(cfg)
 
-    # コーパス観察
-    state.observeCorpus(corpus)
+      # ストリーミング観察
+      state.observeCorpusStream(dataPath)
 
-    # 永続化（概念グラフ、TM、synapses、カタログ）
-    echo "Saving..."
-    var sdb = openStorage(dbPath)
-    sdb.saveConfig(cfg)
-    sdb.saveConceptGraph(state.conceptGraph)
-    sdb.saveTM(state.tm)
-    sdb.saveSynapses(state.bridge)
-    sdb.saveCatalog(state.catalog)
-    sdb.savePhase(state.phase)
-    sdb.close()
-    echo "Saved to: " & dbPath
-    echo "Done!"
+      # 永続化
+      echo "Saving..."
+      var sdb = openStorage(dbPath)
+      sdb.saveConfig(cfg)
+      sdb.saveConceptGraph(state.conceptGraph)
+      sdb.saveTM(state.tm)
+      sdb.saveSynapses(state.bridge)
+      sdb.saveCatalog(state.catalog)
+      sdb.savePhase(state.phase)
+      sdb.close()
+      echo "Saved to: " & dbPath
+      echo "Done!"
+
+    else:
+      # 小規模コーパスは従来方式
+      let corpus = loadTrainingData(dataPath)
+      if corpus.len == 0:
+        echo "No data found in: " & dataPath
+        quit(1)
+
+      echo "Corpus: " & $corpus.len & " conversations"
+
+      # トカナイザ構築（サブセットで学習）
+      let tokCorpus = if corpus.len > 5000: corpus[0..<5000] else: corpus
+      var tok = buildTokenizer(tokCorpus, 4096)
+      echo "Tokenizer: " & $tok.vocab.len & " vocab"
+
+      # 認知状態初期化
+      var cfg = CognitiveConfig(
+        wmCapacity: 7, spreadSteps: 3, spreadDecay: 0.5,
+        activationThreshold: 0.1, tmClauses: 64, tmThreshold: 0.3,
+        tmSParam: 3.0, halfLifeDays: 7.0, maxEpisodes: 5000, topKEpisodes: 3,
+        thinkingEnabled: true, evalEnabled: true,
+        rewardRate: 0.05, punishRate: 0.03
+      )
+      var state = initCognitiveState(cfg)
+      state.tokenizer = tok
+
+      # コーパス観察
+      state.observeCorpus(corpus)
+
+      # 永続化（概念グラフ、TM、synapses、カタログ）
+      echo "Saving..."
+      var sdb = openStorage(dbPath)
+      sdb.saveConfig(cfg)
+      sdb.saveConceptGraph(state.conceptGraph)
+      sdb.saveTM(state.tm)
+      sdb.saveSynapses(state.bridge)
+      sdb.saveCatalog(state.catalog)
+      sdb.savePhase(state.phase)
+      sdb.close()
+      echo "Saved to: " & dbPath
+      echo "Done!"
 
   elif mode == "chat":
     # === チャットモード ===
@@ -141,8 +181,8 @@ proc main() =
       let response = state.process(input)
       echo "Luna: " & (if response.len > 0: response else: "(empty)")
 
-      # シンキングチェーン表示
-      if state.lastThinking.steps.len > 0:
+      # シンキングチェーン表示（--debug のみ）
+      if debugMode and state.lastThinking.steps.len > 0:
         echo ""
         echo "  [Thinking]"
         for step in state.lastThinking.steps:
@@ -152,20 +192,23 @@ proc main() =
             echo "      - " & d
         echo "    Total confidence: " & $formatFloat(state.lastThinking.totalConfidence, ffDecimal, 3)
 
-      # 自己評価表示
-      echo "  [Eval] " & state.lastEval.reason
-      if state.lastEval.contradictions.len > 0:
-        for c in state.lastEval.contradictions:
-          echo "    Contradiction: " & c
-      echo "  [Reward/Punish] total_reward=" & $formatFloat(state.totalReward, ffDecimal, 3) &
-           " total_punish=" & $formatFloat(state.totalPunish, ffDecimal, 3)
-      echo ""
+      # 自己評価表示（--debug のみ）
+      if debugMode:
+        echo "  [Eval] " & state.lastEval.reason
+        if state.lastEval.contradictions.len > 0:
+          for c in state.lastEval.contradictions:
+            echo "    Contradiction: " & c
+        echo "  [Reward/Punish] total_reward=" & $formatFloat(state.totalReward, ffDecimal, 3) &
+             " total_punish=" & $formatFloat(state.totalPunish, ffDecimal, 3)
+        echo ""
 
       # 定期保存（10会話ごと）
       if state.episodeStore.episodes.len mod 10 == 0:
         var saveDb = openStorage(dbPath)
         saveDb.saveConceptGraph(state.conceptGraph)
+        saveDb.saveTM(state.tm)
         saveDb.saveSynapses(state.bridge)
+        saveDb.saveCatalog(state.catalog)
         saveDb.close()
 
   elif mode == "debug":

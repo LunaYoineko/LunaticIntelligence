@@ -1,6 +1,6 @@
 import os, strutils, tables, algorithm, math, times, unicode, sequtils
 import types, tokenizer, concept_graph, working_memory, tsetlin, generator, grammar
-import intent_classifier, semantic_matcher
+import intent_classifier, semantic_matcher, web_search
 
 # ---------------------------------------------------------------------------
 # CognitiveLoop: 認知プロセス統括
@@ -9,12 +9,43 @@ import intent_classifier, semantic_matcher
 
 proc extractWords*(text: string; tokenizer: Tokenizer): seq[string] =
   result = @[]
-  let ids = tokenizer.encode(text)
-  for id in ids:
-    if id >= 0 and id < tokenizer.vocab.len:
-      let word = tokenizer.vocab[id]
-      if word.len > 0 and word != PAD_TOKEN and word != UNK_TOKEN and word != EOS_TOKEN:
-        result.add(word)
+  # If tokenizer is empty, extract words directly from concept graph
+  if tokenizer.vocab.len <= 3:
+    var current = ""
+    var isAlpha = false
+    for rune in text.toRunes:
+      let cp = rune.int32
+      if (cp >= 0x3040 and cp <= 0x309F) or
+         (cp >= 0x30A0 and cp <= 0x30FF) or
+         (cp >= 0x4E00 and cp <= 0x9FFF):
+        if current.len > 0 and isAlpha:
+          result.add(current)
+          current = ""
+          isAlpha = false
+        current.add($rune)
+      elif (cp >= 0x0041 and cp <= 0x005A) or
+           (cp >= 0x0061 and cp <= 0x007A) or
+           (cp >= 0x0030 and cp <= 0x0039) or
+           cp == 0x005F:
+        if current.len > 0 and not isAlpha:
+          result.add(current)
+          current = ""
+        current.add($rune)
+        isAlpha = true
+      else:
+        if current.len > 0:
+          result.add(current)
+          current = ""
+          isAlpha = false
+    if current.len > 0:
+      result.add(current)
+  else:
+    let ids = tokenizer.encode(text)
+    for id in ids:
+      if id >= 0 and id < tokenizer.vocab.len:
+        let word = tokenizer.vocab[id]
+        if word.len > 0 and word != PAD_TOKEN and word != UNK_TOKEN and word != EOS_TOKEN:
+          result.add(word)
 
 proc initCognitiveState*(cfg: CognitiveConfig): CognitiveState =
   result.cfg = cfg
@@ -424,14 +455,15 @@ proc process*(state: var CognitiveState; input: string): string =
 
   state.conceptGraph.resetActivation()
 
-  # 単語レベルで概念を活性化（BPEトークンではなく生の単語）
+  # 単語レベルで概念を活性化（既存概念のみ）
   for word in rawWords:
     if state.conceptGraph.nodeIndex.hasKey(word):
       state.conceptGraph.activateWord(word, 1.0)
     else:
+      # 未知語は追加するが、活性化しない（分類可能なまで待機）
       let cat = categorizeWord(word)
       let nodeId = state.conceptGraph.addNode(word, cat)
-      state.conceptGraph.activateNode(nodeId, 1.0)
+      # activateNode は呼ばない → 推論に影響しない
 
   # BPEトークンも参考として弱く活性化（既存概念とのマッチング用）
   for token in bpeTokens:
@@ -523,60 +555,76 @@ proc process*(state: var CognitiveState; input: string): string =
       var bestScoreCat = 0.0f
       for i, entry in state.catalog.entries:
         var score = 0.0f
-        if entry.inputText.contains(input):
+        # 完全一致は最高スコア
+        if entry.inputText == input:
           score = 1.0f
-        elif input.contains(entry.inputText) and entry.inputText.len > 0:
-          score = entry.inputText.len.float32 / input.len.float32
-        elif entry.keyword.len > 0 and input.contains(entry.keyword):
-          score = 0.7f
+        # 入力がカタログエントリのinputTextを含む（キーワードベースの完全一致）
+        elif entry.keyword.len > 0 and input.toLower().contains(entry.keyword.toLower()):
+          # キーワードが入力の主要部分である場合のみスコア
+          let inputLen = input.len.float32
+          let keywordLen = entry.keyword.len.float32
+          if keywordLen >= inputLen * 0.5:
+            score = 0.8f
+          elif keywordLen >= inputLen * 0.3:
+            score = 0.7f
+          else:
+            score = 0.5f
+        # 入力がエントリを含む（部分一致）
+        elif entry.inputText.len >= 3 and input.contains(entry.inputText):
+          score = entry.inputText.len.float32 / max(input.len, 1).float32 * 0.8f
         if score > bestScoreCat:
           bestScoreCat = score
           bestMatch = i
-      if bestMatch >= 0 and bestScoreCat >= 0.5:
+      if bestMatch >= 0 and bestScoreCat >= 0.7:
         response = state.catalog.entries[bestMatch].outputText
 
   # 8c. カタログで応答できなかった場合のみ文法生成
   if response.len == 0:
-    case intent
-    of iiGreeting:
-      var greetingConcepts: seq[ConceptNode] = @[]
-      for c in allTopConcepts:
-        if c.category == ctGreeting or c.category == ctNoun:
-          greetingConcepts.add(c)
-      if greetingConcepts.len == 0:
-        greetingConcepts = allTopConcepts
-      response = state.generator.generate(greetingConcepts, "greeting")
+    # 意味的な概念がない場合は空を返す（不自然な応答を防止）
+    # 学習済み概念（base_frequency > 0）のみ使用
+    var hasMeaningfulConcepts = false
+    for c in allTopConcepts:
+      if c.category in [ctNoun, ctVerb, ctAdj, ctGreeting, ctQuestion] and c.baseFrequency > 0:
+        hasMeaningfulConcepts = true
+        break
 
-    of iiThanks:
-      response = state.generator.generate(allTopConcepts, "greeting")
+    if hasMeaningfulConcepts:
+      case intent
+      of iiGreeting:
+        var greetingConcepts: seq[ConceptNode] = @[]
+        for c in allTopConcepts:
+          if c.category == ctGreeting or c.category == ctNoun:
+            greetingConcepts.add(c)
+        if greetingConcepts.len == 0:
+          greetingConcepts = allTopConcepts
+        response = state.generator.generate(greetingConcepts, "greeting")
 
-    of iiFarewell:
-      response = state.generator.generate(allTopConcepts, "greeting")
+      of iiThanks:
+        response = state.generator.generate(allTopConcepts, "greeting")
 
-    of iiQuestion:
-      var topicConcepts: seq[ConceptNode] = @[]
-      for c in allTopConcepts:
-        if c.category != ctQuestion and c.category != ctParticle:
-          topicConcepts.add(c)
-      if topicConcepts.len == 0:
-        topicConcepts = allTopConcepts
-      response = state.generator.generate(topicConcepts, "question")
+      of iiFarewell:
+        response = state.generator.generate(allTopConcepts, "greeting")
 
-    of iiRequest:
-      response = state.generator.generate(allTopConcepts, "polite")
+      of iiQuestion:
+        var topicConcepts: seq[ConceptNode] = @[]
+        for c in allTopConcepts:
+          if c.category != ctQuestion and c.category != ctParticle:
+            topicConcepts.add(c)
+        if topicConcepts.len == 0:
+          topicConcepts = allTopConcepts
+        response = state.generator.generate(topicConcepts, "question")
 
-    of iiOpinion, iiAgreement:
-      response = state.generator.generate(allTopConcepts, "description")
+      of iiRequest:
+        response = state.generator.generate(allTopConcepts, "polite")
 
-    of iiStatement, iiOther:
-      if knowledgeConcepts.len > 0:
-        response = state.generator.generate(knowledgeConcepts, "description")
-      else:
+      of iiOpinion, iiAgreement:
         response = state.generator.generate(allTopConcepts, "description")
 
-  # 応答が空の場合のみフォールバック
-  if response.len == 0:
-    response = state.generator.generate(allTopConcepts, "description")
+      of iiStatement, iiOther:
+        if knowledgeConcepts.len > 0:
+          response = state.generator.generate(knowledgeConcepts, "description")
+        else:
+          response = state.generator.generate(allTopConcepts, "description")
 
   # 9. 自己評価
   var evalResult = EvalResult(verdict: evAccept, score: 0.5, reason: "skip",
@@ -631,6 +679,74 @@ proc process*(state: var CognitiveState; input: string): string =
   if state.episodeStore.episodes.len mod 50 == 0:
     state.bridge.decaySynapses()
 
+  # 品質チェック: テンプレート的な応答の検出
+  proc isTemplateArtifact(text: string): bool =
+    if text.len == 0: return false
+    var hasJapanese = false
+    var hasEnglish = false
+    for rune in text.toRunes:
+      let cp = rune.int32
+      if (cp >= 0x3040 and cp <= 0x309F) or (cp >= 0x30A0 and cp <= 0x30FF) or (cp >= 0x4E00 and cp <= 0x9FFF):
+        hasJapanese = true
+      elif (cp >= 0x0041 and cp <= 0x005A) or (cp >= 0x0061 and cp <= 0x007A):
+        hasEnglish = true
+    if hasJapanese and hasEnglish: return true
+    return false
+
+  # 13. Web検索フォールバック（応答が空または低品質/テンプレート的な場合）
+  # 検索結果は直接返すのではなく、認知プロセスに入力して推論に使う
+  if input.len > 0 and (response.len == 0 or isTemplateArtifact(response) or evalResult.score < 0.3):
+    var searcher = initWebSearcher()
+    let knowledge = searcher.getKnowledge(input)
+    if knowledge.len > 0:
+      # 検索結果を日本語に翻訳
+      let translated = searcher.translateKnowledge(knowledge, "ja")
+      if translated.len > 0:
+        # 翻訳結果を概念グラフに追加し、推論に使用
+        let knowledgeWords = extractWords(translated, state.tokenizer)
+        for w in knowledgeWords:
+          if state.conceptGraph.nodeIndex.hasKey(w):
+            state.conceptGraph.activateWord(w, 0.3)
+          else:
+            let cat = categorizeWord(w)
+            let cid = state.conceptGraph.addNode(w, cat)
+            state.conceptGraph.nodes[cid].baseFrequency = 1.0f / knowledgeWords.len.float32
+            state.conceptGraph.activateWord(w, 0.3)
+
+        # 新しい概念で活性化を拡散
+        state.conceptGraph.spreadActivation(steps=2, decay=0.4)
+
+        # TM推論（Web検索結果を学習）
+        let activeIds = state.conceptGraph.getActiveNodeIds()
+        if activeIds.len > 0:
+          let kv = featureVectorFromConcepts(activeIds, state.cfg.tmClauses * 8)
+          # TM学習: Web検索結果は新しい知識として強化
+          let searchIntentClass = 1  # iiQuestion
+          state.tm.train(kv, searchIntentClass, 0.5f)
+          # TM推論で新しい概念の関連を学習
+          discard state.tm.predictWithReasoning(kv)
+
+        # 翻訳結果をカタログに追加（次回以降の推論に使用）
+        if translated.len > 0 and translated.len <= 200 and state.catalog.entries.len < 2000:
+          var catalogIntent = iiQuestion
+          if input.toLower().contains("hello") or input.toLower().contains("hi"):
+            catalogIntent = iiGreeting
+          elif input.toLower().contains("thank"):
+            catalogIntent = iiThanks
+          elif input.toLower().contains("bye") or input.toLower().contains("goodbye"):
+            catalogIntent = iiFarewell
+          state.catalog.entries.add(CatalogEntry(
+            intent: catalogIntent,
+            keyword: input,
+            inputText: input,
+            outputText: translated,
+            weight: 1.0f
+          ))
+
+        # 応答が空の場合は翻訳結果を使用（日本語で）
+        if response.len == 0 or isTemplateArtifact(response):
+          response = translated
+
   return response
 
 # ---------------------------------------------------------------------------
@@ -650,16 +766,33 @@ proc observeCorpus*(state: var CognitiveState; corpus: seq[string]) =
   proc fastExtractWords(text: string): seq[string] =
     result = @[]
     var current = ""
+    var isAlpha = false
     for rune in text.toRunes:
       let cp = rune.int32
+      # CJK文字（日本語）
       if (cp >= 0x3040 and cp <= 0x309F) or
          (cp >= 0x30A0 and cp <= 0x30FF) or
          (cp >= 0x4E00 and cp <= 0x9FFF):
+        if current.len > 0 and isAlpha:
+          result.add(current)
+          current = ""
+          isAlpha = false
         current.add($rune)
+      # 英語（アルファベット＋数字）
+      elif (cp >= 0x0041 and cp <= 0x005A) or
+           (cp >= 0x0061 and cp <= 0x007A) or
+           (cp >= 0x0030 and cp <= 0x0039) or
+           cp == 0x005F:
+        if current.len > 0 and not isAlpha:
+          result.add(current)
+          current = ""
+        current.add($rune)
+        isAlpha = true
       else:
         if current.len > 0:
           result.add(current)
           current = ""
+          isAlpha = false
     if current.len > 0:
       result.add(current)
     # 助詞で分割し、粒子・助動詞は除外
@@ -728,7 +861,7 @@ proc observeCorpus*(state: var CognitiveState; corpus: seq[string]) =
 
   # --- Phase 2: 概念ノード作成 ---
   let t1 = epochTime()
-  let minFreq = max(3, lineCount div 5000)
+  let minFreq = max(1, min(3, lineCount div 100))
   var sortedWords: seq[(string, int)]
   for (word, freq) in wordFreq.pairs:
     if freq >= minFreq:
@@ -785,10 +918,10 @@ proc observeCorpus*(state: var CognitiveState; corpus: seq[string]) =
       # 簡易意図分類
       var tmClass = 8
       let lt = line.inputText.toLower()
-      if lt.contains("おはよう") or lt.contains("こんにちは") or lt.contains("こんばんは"): tmClass = 0
-      elif lt.contains("?") or lt.contains("？") or lt.contains("何") or lt.contains("どこ"): tmClass = 1
-      elif lt.contains("ありがとう"): tmClass = 5
-      elif lt.contains("さようなら") or lt.contains("バイバイ"): tmClass = 6
+      if lt.contains("おはよう") or lt.contains("こんにちは") or lt.contains("こんばんは") or lt.contains("hello") or lt.contains("hi") or lt.contains("hey"): tmClass = 0
+      elif lt.contains("?") or lt.contains("？") or lt.contains("何") or lt.contains("どこ") or lt.contains("what") or lt.contains("how"): tmClass = 1
+      elif lt.contains("ありがとう") or lt.contains("thanks") or lt.contains("thank"): tmClass = 5
+      elif lt.contains("さようなら") or lt.contains("バイバイ") or lt.contains("bye"): tmClass = 6
       state.tm.train(fv, tmClass, 1.0f)
 
     # --- Hebbian（サンプリング） ---
@@ -804,13 +937,13 @@ proc observeCorpus*(state: var CognitiveState; corpus: seq[string]) =
     if line.outputText.len > 0 and line.outputText.len <= 200:
       var intent = iiOther
       let lt = line.inputText.toLower()
-      if lt.contains("おはよう") or lt.contains("こんにちは") or lt.contains("こんばんは"): intent = iiGreeting
-      elif lt.contains("?") or lt.contains("？") or lt.contains("何") or lt.contains("どこ") or lt.contains("誰"): intent = iiQuestion
-      elif lt.contains("ありがとう"): intent = iiThanks
-      elif lt.contains("さようなら") or lt.contains("バイバイ"): intent = iiFarewell
-      elif lt.contains("して") or lt.contains("ください") or lt.contains("くれ"): intent = iiRequest
+      if lt.contains("おはよう") or lt.contains("こんにちは") or lt.contains("こんばんは") or lt.contains("hello") or lt.contains("hi") or lt.contains("hey") or lt.contains("good morning") or lt.contains("good afternoon") or lt.contains("good evening") or lt.contains("やあ"): intent = iiGreeting
+      elif lt.contains("?") or lt.contains("？") or lt.contains("何") or lt.contains("どこ") or lt.contains("誰") or lt.contains("what") or lt.contains("how") or lt.contains("why") or lt.contains("where") or lt.contains("when") or lt.contains("who"): intent = iiQuestion
+      elif lt.contains("ありがとう") or lt.contains("thanks") or lt.contains("thank"): intent = iiThanks
+      elif lt.contains("さようなら") or lt.contains("バイバイ") or lt.contains("bye") or lt.contains("goodbye") or lt.contains("またね"): intent = iiFarewell
+      elif lt.contains("して") or lt.contains("ください") or lt.contains("くれ") or lt.contains("help") or lt.contains("please") or lt.contains("how to"): intent = iiRequest
       let currentCount = catalogCount.getOrDefault(intent.ord, 0)
-      if currentCount < 200:
+      if currentCount < 5000:
         catalog.entries.add(CatalogEntry(
           intent: intent,
           keyword: line.inputText[0..<min(20, line.inputText.len)],
@@ -825,6 +958,218 @@ proc observeCorpus*(state: var CognitiveState; corpus: seq[string]) =
 
   state.catalog = catalog
   echo "  TM+Hebbian+Catalog: " & $formatFloat(epochTime() - t3, ffDecimal, 1) & "s"
+  echo "  Catalog: " & $catalog.entries.len & " entries"
+  echo "Observation complete: " & $state.conceptGraph.conceptCount() & " concepts"
+  echo "Total: " & $formatFloat(epochTime() - t0, ffDecimal, 1) & "s"
+
+# ---------------------------------------------------------------------------
+# 観察モード: ストリーミング版（5T対応）
+# ---------------------------------------------------------------------------
+proc observeCorpusStream*(state: var CognitiveState; corpusPath: string) =
+  echo "Observing corpus (streaming): " & corpusPath
+  let t0 = epochTime()
+
+  # 単語抽出ユーティリティ
+  let splitParticles = ["の", "は", "が", "を", "に", "で", "と", "も", "や", "か",
+                        "な", "から", "まで", "より", "って", "じゃ",
+                        "です", "ます", "だ", "である", "いる", "ある",
+                        "そう", "よ", "ね", "さ", "わ"]
+  let filterWords = ["の", "は", "が", "を", "に", "で", "と", "も", "や", "か",
+                     "な", "から", "まで", "より", "って", "じゃ",
+                     "です", "ます", "だ", "である", "いる", "ある",
+                     "そう", "よ", "ね", "さ", "わ", "だ", "し",
+                     "れ", "ば", "から", "ので", "けど"]
+
+  proc fastExtractWords(text: string): seq[string] =
+    result = @[]
+    var current = ""
+    var isAlpha = false
+    for rune in text.toRunes:
+      let cp = rune.int32
+      # CJK文字（日本語）
+      if (cp >= 0x3040 and cp <= 0x309F) or
+         (cp >= 0x30A0 and cp <= 0x30FF) or
+         (cp >= 0x4E00 and cp <= 0x9FFF):
+        if current.len > 0 and isAlpha:
+          result.add(current)
+          current = ""
+          isAlpha = false
+        current.add($rune)
+      # 英語（アルファベット＋数字）
+      elif (cp >= 0x0041 and cp <= 0x005A) or
+           (cp >= 0x0061 and cp <= 0x007A) or
+           (cp >= 0x0030 and cp <= 0x0039) or
+           cp == 0x005F:
+        if current.len > 0 and not isAlpha:
+          result.add(current)
+          current = ""
+        current.add($rune)
+        isAlpha = true
+      else:
+        if current.len > 0:
+          result.add(current)
+          current = ""
+          isAlpha = false
+    if current.len > 0:
+      result.add(current)
+    var expanded: seq[string] = @[]
+    for w in result:
+      var remaining = w
+      while remaining.len > 0:
+        var found = false
+        for p in splitParticles:
+          if remaining.len > p.len and remaining.endsWith(p):
+            let base = remaining[0..<(remaining.len - p.len)]
+            if base.len >= 2 and base notin filterWords:
+              expanded.add(base)
+            remaining = p
+            found = true
+            break
+        if not found:
+          var runeCount = 0
+          for r in remaining.toRunes: runeCount += 1
+          if runeCount >= 2 and remaining notin filterWords:
+            expanded.add(remaining)
+          break
+    result = expanded
+
+  # --- Phase 1: ストリーミングで単語頻度集計 ---
+  echo "Phase 1: Counting word frequencies..."
+  var wordFreq: Table[string, int]
+  var lineCount = 0
+  var outputBuffer: seq[string] = @[]  # 出力テキストを一時保持
+  var inputBuffer: seq[string] = @[]   # 入力テキストを一時保持
+
+  for line in corpusPath.lines:
+    let trimmed = line.strip()
+    if trimmed.len == 0: continue
+    let pipePos = trimmed.find('|')
+    if pipePos < 0: continue
+    let inputText = trimmed[0..<pipePos].strip()
+    let outputText = trimmed[pipePos+1..^1].strip()
+    if inputText.len == 0 or outputText.len == 0: continue
+
+    let words = fastExtractWords(inputText)
+    var uniqueWords: seq[string] = @[]
+    for w in words:
+      if w notin uniqueWords:
+        uniqueWords.add(w)
+        wordFreq[w] = wordFreq.getOrDefault(w, 0) + 1
+
+    inputBuffer.add(inputText)
+    outputBuffer.add(outputText)
+    inc lineCount
+
+    if lineCount mod 100000 == 0:
+      echo "  Counted: " & $lineCount & " lines, " & $wordFreq.len & " unique words"
+
+  echo "  Total: " & $lineCount & " lines, " & $wordFreq.len & " unique words"
+  echo "  Buffer size: " & $inputBuffer.len & " entries"
+
+  # --- Phase 2: 高頻度単語で概念ノード作成 ---
+  echo "Phase 2: Building concept nodes..."
+  let t1 = epochTime()
+  let minFreq = max(3, lineCount div 50000)
+  var sortedWords: seq[(string, int)]
+  for (word, freq) in wordFreq.pairs:
+    if freq >= minFreq:
+      sortedWords.add((word, freq))
+  sortedWords.sort(proc(a, b: (string, int)): int = cmp(b[1], a[1]))
+
+  for (word, freq) in sortedWords:
+    let category = categorizeWord(word)
+    let nodeId = state.conceptGraph.addNode(word, category)
+    state.conceptGraph.nodes[nodeId].baseFrequency = freq.float32 / sortedWords.len.float32
+
+  echo "  Nodes: " & $state.conceptGraph.nodes.len & " (" & $formatFloat(epochTime() - t1, ffDecimal, 1) & "s)"
+
+  # --- Phase 3: 2パス目（概念ID割り当て＋エッジ＋TM＋Hebbian＋カタログ） ---
+  echo "Phase 3: Processing concepts, edges, TM, Hebbian, catalog..."
+  let t2 = epochTime()
+  var catalog = ResponseCatalog(entries: @[])
+  var catalogCount: Table[int, int]
+  var hebbianSampleStep = max(1, lineCount div 10000)
+  var processed = 0
+
+  for i in 0..<inputBuffer.len:
+    let inputText = inputBuffer[i]
+    let outputText = outputBuffer[i]
+
+    let words = fastExtractWords(inputText)
+    var inputCids: seq[int] = @[]
+    for w in words:
+      if state.conceptGraph.nodeIndex.hasKey(w):
+        inputCids.add(state.conceptGraph.nodeIndex[w])
+
+    # --- エッジ構築 ---
+    for j in 0..<(words.len - 1):
+      let w1 = words[j]
+      let w2 = words[j + 1]
+      if state.conceptGraph.nodeIndex.hasKey(w1) and state.conceptGraph.nodeIndex.hasKey(w2):
+        let cat1 = categorizeWord(w1)
+        let cat2 = categorizeWord(w2)
+        var relation: EdgeRelation
+        var weight: float32 = 0.3
+        if cat1 == ctParticle or cat2 == ctParticle: relation = erRelatedTo
+        elif cat1 == ctNoun and cat2 == ctVerb: relation = erCauses; weight = 0.5
+        elif cat1 == ctVerb and cat2 == ctNoun: relation = erHasProperty; weight = 0.5
+        elif cat1 == ctNoun and cat2 == ctAdj: relation = erHasProperty; weight = 0.4
+        elif cat1 == ctAdj and cat2 == ctNoun: relation = erRelatedTo; weight = 0.4
+        elif cat1 == ctVerb and cat2 == ctVerb: relation = erCauses; weight = 0.4
+        else: relation = erRelatedTo
+        state.conceptGraph.addEdge(w1, w2, relation, weight)
+
+    # --- TM学習 ---
+    if inputCids.len > 0:
+      let fv = featureVectorFromConcepts(inputCids, state.cfg.tmClauses * 8)
+      var tmClass = 8
+      let lt = inputText.toLower()
+      if lt.contains("おはよう") or lt.contains("こんにちは") or lt.contains("こんばんは") or lt.contains("hello") or lt.contains("hi") or lt.contains("hey"): tmClass = 0
+      elif lt.contains("?") or lt.contains("？") or lt.contains("何") or lt.contains("どこ") or lt.contains("what") or lt.contains("how"): tmClass = 1
+      elif lt.contains("ありがとう") or lt.contains("thanks") or lt.contains("thank"): tmClass = 5
+      elif lt.contains("さようなら") or lt.contains("バイバイ") or lt.contains("bye"): tmClass = 6
+      state.tm.train(fv, tmClass, 1.0f)
+
+    # --- Hebbian（サンプリング） ---
+    if processed mod hebbianSampleStep == 0 and inputCids.len >= 2:
+      for j in 0..<min(inputCids.len, 5):
+        for k in (j+1)..<min(inputCids.len, 5):
+          let w1 = state.conceptGraph.getWord(inputCids[j])
+          let w2 = state.conceptGraph.getWord(inputCids[k])
+          if w1.len > 0 and w2.len > 0:
+            state.conceptGraph.hebbianStrengthen(w1, w2, 0.01)
+
+    # --- カタログ ---
+    if outputText.len > 0 and outputText.len <= 200:
+      var intent = iiOther
+      let lt = inputText.toLower()
+      if lt.contains("おはよう") or lt.contains("こんにちは") or lt.contains("こんばんは") or lt.contains("hello") or lt.contains("hi") or lt.contains("hey") or lt.contains("good morning") or lt.contains("good afternoon") or lt.contains("good evening") or lt.contains("やあ"): intent = iiGreeting
+      elif lt.contains("?") or lt.contains("？") or lt.contains("何") or lt.contains("どこ") or lt.contains("誰") or lt.contains("what") or lt.contains("how") or lt.contains("why") or lt.contains("where") or lt.contains("when") or lt.contains("who"): intent = iiQuestion
+      elif lt.contains("ありがとう") or lt.contains("thanks") or lt.contains("thank"): intent = iiThanks
+      elif lt.contains("さようなら") or lt.contains("バイバイ") or lt.contains("bye") or lt.contains("goodbye") or lt.contains("またね"): intent = iiFarewell
+      elif lt.contains("して") or lt.contains("ください") or lt.contains("くれ") or lt.contains("help") or lt.contains("please") or lt.contains("how to"): intent = iiRequest
+      let currentCount = catalogCount.getOrDefault(intent.ord, 0)
+      if currentCount < 20000:
+        catalog.entries.add(CatalogEntry(
+          intent: intent,
+          keyword: inputText[0..<min(20, inputText.len)],
+          inputText: inputText,
+          outputText: outputText,
+          weight: 1.0f
+        ))
+        catalogCount[intent.ord] = currentCount + 1
+
+    inc processed
+    if processed mod 100000 == 0:
+      echo "  Processed: " & $processed & "/" & $lineCount
+
+  # バッファ解放
+  inputBuffer.setLen(0)
+  outputBuffer.setLen(0)
+
+  state.catalog = catalog
+  echo "  Edges: " & $state.conceptGraph.edges.len
+  echo "  TM+Hebbian+Catalog: " & $formatFloat(epochTime() - t2, ffDecimal, 1) & "s"
   echo "  Catalog: " & $catalog.entries.len & " entries"
   echo "Observation complete: " & $state.conceptGraph.conceptCount() & " concepts"
   echo "Total: " & $formatFloat(epochTime() - t0, ffDecimal, 1) & "s"

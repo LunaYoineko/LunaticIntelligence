@@ -23,16 +23,33 @@ proc buildTokenizer*(corpus: seq[string]; maxVocab: int = 4096): Tokenizer =
   var wordFreq: Table[string, int]
   for text in corpus:
     var current = ""
+    var isAlpha = false
     for rune in text.toRunes:
       let cp = rune.int32
+      # CJK文字（日本語）
       if (cp >= 0x3040 and cp <= 0x309F) or
          (cp >= 0x30A0 and cp <= 0x30FF) or
          (cp >= 0x4E00 and cp <= 0x9FFF):
+        if current.len > 0 and isAlpha:
+          wordFreq[current] = wordFreq.getOrDefault(current, 0) + 1
+          current = ""
+          isAlpha = false
         current.add($rune)
+      # 英語（アルファベット＋数字）
+      elif (cp >= 0x0041 and cp <= 0x005A) or
+           (cp >= 0x0061 and cp <= 0x007A) or
+           (cp >= 0x0030 and cp <= 0x0039) or
+           cp == 0x005F:  # アンダースコア
+        if current.len > 0 and not isAlpha:
+          wordFreq[current] = wordFreq.getOrDefault(current, 0) + 1
+          current = ""
+        current.add($rune)
+        isAlpha = true
       else:
         if current.len > 0:
           wordFreq[current] = wordFreq.getOrDefault(current, 0) + 1
           current = ""
+          isAlpha = false
     if current.len > 0:
       wordFreq[current] = wordFreq.getOrDefault(current, 0) + 1
 

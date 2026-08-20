@@ -15,27 +15,38 @@ proc initDefaultPatterns(): seq[IntentPattern] =
                    "こんにちは", "ちわ", "ちわす",
                    "こんばんは", "ばんは",
                    "はじめまして", "初めまして",
-                   "やあ", "よっす", "あんにょ"], rcGreetingResponse, 10),
+                   "やあ", "よっす", "あんにょ",
+                   "hello", "hi", "hey", "good morning", "good afternoon", "good evening"], rcGreetingResponse, 10),
 
     (iiThanks, @["ありがとう", "あざす", "サンキュー", "感謝",
-                 "すみません", "ごめん", "ごめんなさい", "すまん"], rcThanksResponse, 10),
+                 "すみません", "ごめん", "ごめんなさい", "すまん",
+                 "thank", "thanks", "appreciate", "sorry", "excuse me"], rcThanksResponse, 10),
 
     (iiFarewell, @["さようなら", "さよなら", "じゃあね", "またね",
-                   "バイバイ", "また明日"], rcFarewellResponse, 10),
+                   "バイバイ", "また明日",
+                   "bye", "goodbye", "see you", "farewell"], rcFarewellResponse, 10),
 
     (iiQuestion, @["何", "なに", "どこ", "いつ", "誰", "だれ",
-                   "なぜ", "どう", "どの", "どんな", "いくら", "いくつ"], rcQuestionAnswer, 8),
+                   "なぜ", "どう", "どの", "どんな", "いくら", "いくつ",
+                   "what", "where", "when", "who", "why", "how",
+                   "which", "whom", "whose"], rcQuestionAnswer, 8),
 
     (iiQuestion, @["か", "？", "?"], rcQuestionAnswer, 5),
 
     (iiRequest, @["して", "教えて", "やって", "頼む", "お願い", "～して",
-                  "ほしい", "見たい", "知りたい", "行きたい"], rcRequestCompliance, 8),
+                  "ほしい", "見たい", "知りたい", "行きたい",
+                  "please", "help", "show", "tell", "explain",
+                  "want", "need", "like to"], rcRequestCompliance, 8),
 
     (iiOpinion, @["いいね", "好き", "楽しい", "面白い", "かわいい", "すごい",
-                  "嫌い", "つまらない", "うんざり", "イヤ"], rcOpinionResponse, 7),
+                  "嫌い", "つまらない", "うんざり", "イヤ",
+                  "good", "bad", "like", "love", "hate", "fun",
+                  "boring", "amazing", "awesome", "terrible"], rcOpinionResponse, 7),
 
     (iiAgreement, @["そうですね", "ほんとだ", "確かに", "まさに", "その通り",
-                    "なるほど", "へえ", "マジ", "そうなんだ"], rcAgreementResponse, 7),
+                    "なるほど", "へえ", "マジ", "そうなんだ",
+                    "yes", "yeah", "right", "exactly", "agree",
+                    "absolutely", "totally", "indeed"], rcAgreementResponse, 7),
   ]
 
   result = @[]
