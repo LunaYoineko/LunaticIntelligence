@@ -1,0 +1,43 @@
+# Binaries
+src/lunallm
+src/test_*
+*.exe
+
+# Database
+*.db
+
+# Corpus files (large, not for git)
+corpus/
+corpus_*.txt
+corpus_combined.txt
+ollama_*.txt
+data.txt
+test*.txt
+
+# CUDA (not needed for CPU-only)
+cuda/
+
+# Old versions
+old_v1/
+
+# Design docs (not needed for distribution)
+CUDA_KERNEL_DESIGN.md
+LunaLLM_DESIGN.md
+
+# Nim build artifacts
+nimcache/
+nimblecache/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Temp
+/tmp/
