@@ -1,22 +1,32 @@
-# LunaLLM Agents Guide
+# LunaticIntelligence Agents Guide
 
 ## ビルド
 
 ```bash
-nim c -d:release src/lunallm.nim
+nim c -d:release -d:ssl src/lunatic.nim
+nim c -d:release -d:ssl --mm:orc --threads:off src/server.nim
+nim c -d:release -d:ssl --mm:orc --threads:off src/mcp_server.nim
 ```
 
 ## 実行
 
 ```bash
 # 学習
-MODE=observe OBSERVE_DATA=corpus_combined.txt DB=luna_cognitive.db ./src/lunallm
+./src/lunatic observe --data corpus_combined.txt --db lunatic_cognitive.db
 
 # チャット
-MODE=chat DB=luna_cognitive.db ./src/lunallm
+./src/lunatic chat --db lunatic_cognitive.db
 
 # デバッグ
-MODE=debug DB=luna_cognitive.db ./src/lunallm
+./src/lunatic debug --db lunatic_cognitive.db
+
+# サーバー
+./src/lunatic serve --port 8080 --db lunatic_cognitive.db
+
+# 互換（環境変数）
+MODE=observe OBSERVE_DATA=corpus_combined.txt DB=lunatic_cognitive.db ./src/lunatic
+MODE=chat DB=lunatic_cognitive.db ./src/lunatic
+MODE=debug DB=lunatic_cognitive.db ./src/lunatic
 ```
 
 ## プロジェクト構成
@@ -29,13 +39,18 @@ MODE=debug DB=luna_cognitive.db ./src/lunallm
 - `src/grammar.nim` - 日本語文法エンジン
 - `src/storage.nim` - SQLite永続化
 - `src/tokenizer.nim` - 単語分割（BPE不要、高頻度辞書）
-- `src/lunallm.nim` - メインバイナリ
+- `src/code_structure.nim` - 軽量Nim AST解析
+- `src/db_compress.nim` - CatelliteCompressor ラッパー
+- `src/server.nim` - HTTPサーバー (/lunatic/chat)
+- `src/mcp_server.nim` - MCPサーバー (lunatic_*)
+- `src/lunatic.nim` - メインバイナリ
 
 ## コーディング規約
 
 - Nim 2.2.10+
-- メモリ管理: refc
-- リリースビルド: `-d:release`
+- メモリ管理: orc
+- スレッド: off
+- リリースビルド: `-d:release -d:ssl`
 - DB: SQLite（軽量配布対応）
 - コメント: 必要最小限
 - エラー処理: `except CatchableError`

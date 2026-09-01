@@ -149,8 +149,10 @@ proc loadConceptGraph*(sdb: StorageDB): ConceptGraph =
       result.edgeSet[(fromId, toId)] = edgeId
 
 # ---------------------------------------------------------------------------
-# TM
+# TM - chunked to handle 2.1B params (8192 clauses) avoiding SQLite limits
 # ---------------------------------------------------------------------------
+const TmChunkSize = 500 * 1024
+
 proc saveTM*(sdb: StorageDB; tm: HierarchicalTM) =
   sdb.db.exec(sql"DELETE FROM tm_states")
   for li in 0..<tm.layers.len:
@@ -158,9 +160,40 @@ proc saveTM*(sdb: StorageDB; tm: HierarchicalTM) =
     var blob = newString(states.len)
     for i in 0..<states.len:
       blob[i] = char(states[i] + 128)
-    sdb.db.exec(sql"INSERT INTO tm_states VALUES (?, ?, ?)", li, 0, blob)
+    var offset = 0
+    var chunkIdx = 0
+    while offset < blob.len:
+      let chunkLen = min(TmChunkSize, blob.len - offset)
+      let chunk = blob[offset ..< offset + chunkLen]
+      sdb.db.exec(sql"INSERT INTO tm_states VALUES (?, ?, ?)", li, chunkIdx, chunk)
+      offset += chunkLen
+      inc chunkIdx
+    if blob.len == 0:
+      sdb.db.exec(sql"INSERT INTO tm_states VALUES (?, ?, ?)", li, 0, "")
 
 proc loadTM*(sdb: StorageDB; tm: var HierarchicalTM) =
+  var chunks: Table[int, seq[string]] = initTable[int, seq[string]]()
+  var hasChunked = false
+  var hasLegacy = false
+  for row in sdb.db.fastRows(sql"SELECT layer_idx, clause_idx, states FROM tm_states"):
+    let li = parseInt(row[0])
+    let chunkIdx = if row.len > 2: parseInt(row[1]) else: 0
+    let blob = if row.len > 2: row[2] else: row[1]
+    hasChunked = true
+    if not chunks.hasKey(li):
+      chunks[li] = @[]
+    while chunks[li].len <= chunkIdx:
+      chunks[li].add("")
+    chunks[li][chunkIdx] = blob
+  if hasChunked and chunks.len > 0:
+    for li, parts in chunks.pairs:
+      if li < tm.layers.len:
+        var full = ""
+        for p in parts: full.add(p)
+        for i in 0..<min(full.len, tm.layers[li].states.len):
+          tm.layers[li].states[i] = int8(full[i].ord - 128)
+    return
+  # fallback for old DBs with 2 columns
   for row in sdb.db.fastRows(sql"SELECT layer_idx, states FROM tm_states"):
     let li = parseInt(row[0])
     if li < tm.layers.len:

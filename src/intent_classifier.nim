@@ -33,10 +33,10 @@ proc initDefaultPatterns(): seq[IntentPattern] =
 
     (iiQuestion, @["か", "？", "?"], rcQuestionAnswer, 5),
 
-    (iiRequest, @["して", "教えて", "やって", "頼む", "お願い", "～して",
+    (iiRequest, @["して", "教えて", "やって", "頼む", "お願い", "～して", "書いて", "生成", "作って", "実装",
                   "ほしい", "見たい", "知りたい", "行きたい",
                   "please", "help", "show", "tell", "explain",
-                  "want", "need", "like to"], rcRequestCompliance, 8),
+                  "want", "need", "like to", "hello world", "fizzbuzz", "フィズバズ"], rcRequestCompliance, 12),
 
     (iiOpinion, @["いいね", "好き", "楽しい", "面白い", "かわいい", "すごい",
                   "嫌い", "つまらない", "うんざり", "イヤ",

@@ -41,3 +41,15 @@ Thumbs.db
 
 # Temp
 /tmp/
+corpus_download
+src/lunatic
+convert_corpus
+large_test.db-shm
+large_test.db-wal
+medium_test.txt
+small_test.txt
+small_test2.txt
+test_search7
+test_search9
+test_search_debug
+test_wiki_jp

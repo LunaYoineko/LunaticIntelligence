@@ -375,6 +375,7 @@ type
     catalog*: ResponseCatalog
     generator*: TextGenerator
     intentClassifier*: IntentClassifier  # 意図分類器
+    llmDBPath*: string                  # LLM重みDBパス
     phase*: int                # 0:観察, 1:オウム返し, 2:理解, 3:生成
     lastThinking*: ThinkingChain   # 最後のシンキングチェーン
     lastEval*: EvalResult          # 最後の自己評価結果

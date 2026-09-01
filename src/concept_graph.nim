@@ -1,5 +1,19 @@
-import tables, algorithm, math, times, strutils, unicode
+import tables, algorithm, math, times, strutils, unicode, random, os
 import types, tokenizer
+
+proc trueRandFloat*(): float32 =
+  ## 真乱数 0.0..1.0 (/dev/urandom 利用、失敗時は疑似乱数フォールバック)
+  try:
+    var b: array[4, byte]
+    let f = open("/dev/urandom", fmRead)
+    let n = f.readBytes(b, 0, 4)
+    f.close()
+    if n == 4:
+      let u = uint32(b[0]) or (uint32(b[1]) shl 8) or (uint32(b[2]) shl 16) or (uint32(b[3]) shl 24)
+      return float32(u) / float32(high(uint32))
+  except:
+    discard
+  return rand(1.0).float32
 
 # ---------------------------------------------------------------------------
 # ConceptGraph: 意味記憶ネットワーク
@@ -375,12 +389,19 @@ proc hebbianStrengthen*(graph: var ConceptGraph;
 
   if graph.edgeSet.hasKey(key):
     let edgeId = graph.edgeSet[key]
-    graph.edges[edgeId].weight = min(1.0, graph.edges[edgeId].weight + amount)
+    # 確率的忘却と揺らぎを注入（真乱数で人間らしい迷い）。コード時は呼び出し側でamountを小さく
+    let noise = (trueRandFloat() - 0.5f) * 0.01f
+    let effective = clamp(amount + noise, 0.01f, 0.2f)
+    graph.edges[edgeId].weight = min(1.0, graph.edges[edgeId].weight + effective)
+    # 忘却: 極低確率で弱減衰（真乱数）
+    if trueRandFloat() < 0.01f:
+      graph.edges[edgeId].weight *= 0.99f
     graph.edges[edgeId].hebbianCount += 1
     return
 
-  # エッジがなければ新規作成
-  graph.addEdge(word1, word2, erRelatedTo, 0.3 + amount)
+  # エッジがなければ新規作成（揺らぎ込み・真乱数）
+  let noise2 = (trueRandFloat() - 0.5f) * 0.01f
+  graph.addEdge(word1, word2, erRelatedTo, clamp(0.3f + amount + noise2, 0.1f, 0.5f))
 
 # ---------------------------------------------------------------------------
 # 出力（デバッグ用）
