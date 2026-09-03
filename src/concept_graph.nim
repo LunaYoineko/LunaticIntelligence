@@ -1,5 +1,5 @@
-import tables, algorithm, math, times, strutils, unicode, random, os
-import types, tokenizer
+import tables, algorithm, math, times, strutils, unicode, random
+import types
 
 proc trueRandFloat*(): float32 =
   ## 真乱数 0.0..1.0 (/dev/urandom 利用、失敗時は疑似乱数フォールバック)
@@ -121,7 +121,7 @@ proc buildFromCorpus*(graph: var ConceptGraph; corpus: seq[string]) =
   echo "Building concept graph from corpus..."
 
   # 意味のないトークンをフィルタ
-  proc isMeaningful(word: string): bool =
+  proc isMeaningful(word: string): bool {.used.} =
     if word.len == 0: return false
     if word == PAD_TOKEN or word == UNK_TOKEN or word == EOS_TOKEN: return false
     if word in ["、", "。", "！", "？", "「", "」", "（", "）", "…", "・", "～",

@@ -29,11 +29,18 @@ proc initState() =
     globalState = initCognitiveState(globalCfg)
     hasState = true
 
-proc handleChat(input: string): string {.gcsafe.} =
+proc handleChat(input: string; systemPrompt: string = ""): string {.gcsafe.} =
   {.cast(gcsafe).}:
     if not hasState:
       initState()
-    return globalState.process(input)
+    if systemPrompt.len > 0:
+      return globalState.process(input, systemPrompt)
+    else:
+      # 環境変数 SYSTEM_PROMPT があればそれを使用（コード直書きではない）
+      let envPrompt = getEnv("SYSTEM_PROMPT", "")
+      if envPrompt.len > 0:
+        return globalState.process(input, envPrompt)
+      return globalState.process(input)
 
 proc handleRequest(req: Request) {.async, gcsafe.} =
   let path = req.url.path
@@ -43,6 +50,7 @@ proc handleRequest(req: Request) {.async, gcsafe.} =
   if req.reqMethod == HttpPost and (path == "/lunatic/chat" or path == "/luna/chat" or path == "/chat" or path == "/v1/chat/completions"):
     var body = req.body
     var inputText = ""
+    var systemPrompt = ""
     try:
       let j = parseJson(body)
       if j.hasKey("message"):
@@ -61,12 +69,27 @@ proc handleRequest(req: Request) {.async, gcsafe.} =
         inputText = j["prompt"].getStr()
       else:
         inputText = body
+      # システムプロンプトはユーザーが指定（コード直書きではない）
+      if j.hasKey("system"):
+        systemPrompt = j["system"].getStr()
+      elif j.hasKey("system_prompt"):
+        systemPrompt = j["system_prompt"].getStr()
+      elif j.hasKey("systemPrompt"):
+        systemPrompt = j["systemPrompt"].getStr()
+      elif j.hasKey("instruction"):
+        systemPrompt = j["instruction"].getStr()
+      # messages配列内に system role があればそれを優先
+      if j.hasKey("messages") and j["messages"].kind == JArray:
+        for m in j["messages"]:
+          if m.hasKey("role") and m["role"].getStr() == "system" and m.hasKey("content"):
+            systemPrompt = m["content"].getStr()
+            break
     except CatchableError:
       inputText = body
     if inputText.strip().len == 0:
       await req.respond(Http400, """{"error":"empty input"}""", newHttpHeaders([("Content-Type","application/json")]))
       return
-    let resp = handleChat(inputText)
+    let resp = handleChat(inputText, systemPrompt)
     var outJson: JsonNode
     if path == "/v1/chat/completions":
       outJson = %*{

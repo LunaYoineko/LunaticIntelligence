@@ -1,5 +1,5 @@
 import strutils, tables, unicode, algorithm
-import types, concept_graph
+import types
 
 # ---------------------------------------------------------------------------
 # SemanticMatcher: 意味レベルのマッチング

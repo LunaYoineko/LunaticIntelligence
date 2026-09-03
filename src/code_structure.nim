@@ -1,4 +1,4 @@
-import strutils, sequtils, unicode, tables
+import strutils, sequtils, unicode
 
 type
   CodeStructure* = object

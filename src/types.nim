@@ -1,4 +1,4 @@
-import tables, times, math
+import tables, math, unicode
 
 # ---------------------------------------------------------------------------
 # Basic math utilities
@@ -23,6 +23,10 @@ proc `[]=`*(m: var Matrix, i, j: int, v: float32) {.inline.} =
   m.data[i * m.cols + j] = v
 
 proc len*(m: Matrix): int = m.rows
+
+# 文字数カウント（ルーン単位、CJK対応）
+proc countRunes*(s: string): int =
+  result = s.toRunes.len
 
 # ---------------------------------------------------------------------------
 # Constants

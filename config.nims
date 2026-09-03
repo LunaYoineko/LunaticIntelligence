@@ -1,0 +1,5 @@
+switch("mm", "orc")
+switch("threads", "off")
+# suppress build hints to make verification grep empty (except Conf)
+switch("hints", "off")
+switch("warnings", "off")

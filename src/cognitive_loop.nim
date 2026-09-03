@@ -1,8 +1,13 @@
+{.push warning[UnusedImport]: off, hint[XDeclaredButNotUsed]: off, hint[DuplicateModuleImport]: off, warning[ResultShadowed]: off, warning[UnreachableElse]: off.}
 import os, strutils, tables, algorithm, math, times, unicode, sequtils, random
 import types, tokenizer, concept_graph, working_memory, tsetlin, generator, grammar
-import intent_classifier, semantic_matcher, web_search
+import intent_classifier, semantic_matcher, web_search, simhash
 import code_structure
 import llm
+import storage
+import db_connector/db_sqlite
+import resource_governor
+import moe
 
 proc trueRandFloatCog*(): float32 =
   try:
@@ -20,6 +25,13 @@ proc trueRandFloatCog*(): float32 =
 # web_search から関数をインポート
 from web_search import calculateExpression
 
+const STOP_WORDS_EARLY* = ["の", "は", "が", "を", "に", "で", "と", "も", "や", "か",
+                     "な", "から", "まで", "より", "って", "じゃ",
+                     "です", "ます", "だ", "である", "いる", "ある",
+                     "そう", "よ", "ね", "さ", "わ", "だ", "し",
+                     "れ", "ば", "から", "ので", "けど", "から",
+                     "こと", "もの", "ため", "ところ", "とき", "よう", "そう"]
+
 # 前方宣言
 proc extractWords*(text: string; tokenizer: Tokenizer): seq[string]
 
@@ -30,191 +42,579 @@ proc fillTemplate*(tmpl: string; replacements: Table[string, string]): string =
   return result
 
 proc chooseRandomTemplate*(templates: seq[string]): string =
-  if templates.len == 0:
-    return ""
-  return templates[rand(0..<templates.len)]
-
-# クールでミステリアスな口調のテンプレート
-proc getCoolResponse*(intent: InputIntent; concepts: seq[ConceptNode]; input: string): string =
-  ## クールでミステリアスな応答を返す (フォールバック用)
-  case intent
-  of iiGreeting:
-    return chooseRandomTemplate(@[
-      "呼ばれた気がする...",
-      "呼んだ?...",
-      "はーい...",
-      "何か用かな?...",
-      "こんにちは..."
-    ])
-  of iiQuestion:
-    if concepts.len > 0:
-      var words: seq[string] = @[]
-      for c in concepts:
-        if c.activation > 0.3:
-          words.add(c.word)
-      if words.len > 0:
-        let uniqueWords = words.deduplicate
-        if uniqueWords.len > 1:
-          return uniqueWords.join("や") & "について..."
-        else:
-          return uniqueWords[0] & "..."
-      else:
-        return "その質問..."
-    else:
-      return "何について...?"
-  of iiRequest:
-    if concepts.len > 0:
-      return "わかったよ... " & concepts[0].word & "について..."
-    else:
-      return "わかったよ..."
-  of iiThanks:
-    return chooseRandomTemplate(@[
-      "どういたしまして...",
-      "いいってことよ...",
-      "気にしないで..."
-    ])
-  of iiFarewell:
-    return chooseRandomTemplate(@[
-      "じゃね...",
-      "またね...",
-      "バイバイ..."
-    ])
-  of iiOpinion:
-    if concepts.len > 0:
-      return "「" & concepts[0].word & "」..."
-    else:
-      return "その気持ち..."
-  of iiStatement:
-    if concepts.len > 0:
-      var words: seq[string] = @[]
-      for c in concepts:
-        if c.activation > 0.3:
-          words.add(c.word)
-      if words.len > 0:
-        let uniqueWords = words.deduplicate
-        if uniqueWords.len > 1:
-          return uniqueWords.join("や") & "..."
-        else:
-          return uniqueWords[0] & "..."
-      else:
-        return "..."
-    else:
-      return "..."
-  else:
-    return "..."
+  if templates.len == 0: return ""
+  let idx = int(trueRandFloatCog() * templates.len.float32) mod templates.len
+  return templates[idx]
 
 # LLMを使用した応答生成 - フロー: TMで意味理解→ピックアップ→LLM推論(Thinking含む)→回答
-proc generateWithLLM*(state: var CognitiveState; concepts: seq[ConceptNode]; intent: InputIntent; input: string; forceLLM: bool = false): string =
-  ## 右脳(TM)で意味理解しピックアップした概念を左脳(LLM)に渡し、Thinkingを含めて生成
-  let rightBrainResponse = getCoolResponse(intent, concepts, input)
-  # 未学習LLMのゴミ(<UNK>)出力を回避: カタログ/TM応答をそのまま返す
+proc sliceRunes(s: string; n: int): string =
+  var cnt = 0
+  result = ""
+  for r in s.toRunes:
+    if cnt >= n: break
+    result.add($r); inc cnt
+
+proc sliceRunesRange(s: string; a,b: int): string =
+  var cnt = 0
+  result = ""
+  for r in s.toRunes:
+    if cnt >= b: break
+    if cnt >= a: result.add($r)
+    inc cnt
+
+proc isBadWord*(w: string): bool =
+  if w.len == 0: return true
+  if w in STOP_WORDS_EARLY: return true
+  if w.len < 2 and w notin ["AI", "Io"]: return true
+  var rc = 0
+  for _ in w.toRunes: inc rc
+  if rc < 2: return true
+  return false
+
+proc topWord*(concepts: seq[ConceptNode]): string =
+  var best = ""
+  var bestAct = -1.0f
+  for c in concepts:
+    if isBadWord(c.word): continue
+    if c.activation > bestAct:
+      bestAct = c.activation
+      best = c.word
+  return best
+
+proc collectWords*(concepts: seq[ConceptNode]; maxN: int = 5): seq[string] =
+  result = @[]
+  for c in concepts:
+    if result.len >= maxN: break
+    if isBadWord(c.word): continue
+    if c.activation > 0.3:
+      result.add(c.word)
+  if result.len == 0:
+    for c in concepts:
+      if result.len >= maxN: break
+      if c.word.len > 0 and c.word notin STOP_WORDS_EARLY:
+        result.add(c.word)
+
+# 高速単語抽出: CJK/英数字混在テキストから単語を分割（助詞分割・フィルタリング付き）
+proc fastExtractWords*(text: string): seq[string] =
+  result = @[]
+  var current = ""
+  var isAlpha = false
+  let splitParticles = ["について", "とは何", "とは", "教えて", "何ですか", "ですか",
+                        "の", "は", "が", "を", "に", "で", "と", "も", "や", "か",
+                        "な", "から", "まで", "より", "って", "じゃ",
+                        "です", "ます", "だ", "である", "いる", "ある",
+                        "そう", "よ", "ね", "さ", "わ"]
+  let filterWords = ["について", "とは何", "とは", "教えて", "何ですか", "ですか",
+                     "の", "は", "が", "を", "に", "で", "と", "も", "や", "か",
+                     "な", "から", "まで", "より", "って", "じゃ",
+                     "です", "ます", "だ", "である", "いる", "ある",
+                     "そう", "よ", "ね", "さ", "わ", "だ", "し",
+                     "れ", "ば", "から", "ので", "けど"]
+  for rune in text.toRunes:
+    let cp = rune.int32
+    # CJK文字（日本語）
+    if (cp >= 0x3040 and cp <= 0x309F) or
+       (cp >= 0x30A0 and cp <= 0x30FF) or
+       (cp >= 0x4E00 and cp <= 0x9FFF):
+      if current.len > 0 and isAlpha:
+        result.add(current)
+        current = ""
+        isAlpha = false
+      current.add($rune)
+    # 英語（アルファベット＋数字）
+    elif (cp >= 0x0041 and cp <= 0x005A) or
+         (cp >= 0x0061 and cp <= 0x007A) or
+         (cp >= 0x0030 and cp <= 0x0039) or
+         cp == 0x005F:
+      if current.len > 0 and not isAlpha:
+        result.add(current)
+        current = ""
+        isAlpha = false
+      current.add($rune)
+      isAlpha = true
+    else:
+      if current.len > 0:
+        result.add(current)
+        current = ""
+        isAlpha = false
+  if current.len > 0:
+    result.add(current)
+  # 助詞で分割し、粒子・助動詞は除外
+  var expanded: seq[string] = @[]
+  for w in result:
+    var remaining = w
+    while remaining.len > 0:
+      var found = false
+      for p in splitParticles:
+        if remaining.len > p.len and remaining.endsWith(p):
+          let base = remaining[0..<(remaining.len - p.len)]
+          if base.len >= 2 and base notin filterWords:
+            expanded.add(base)
+          remaining = p
+          found = true
+          break
+      if not found:
+        var runeCount = 0
+        for r in remaining.toRunes: runeCount += 1
+        if runeCount >= 2 and remaining notin filterWords:
+          expanded.add(remaining)
+        break
+  result = expanded
+
+proc shouldSearchForKnowledge*(state: CognitiveState; input: string; intent: InputIntent; desiredLen: int;
+                                 topConcepts: seq[ConceptNode]; bestScore: float32; hasCatalogMatch: bool): bool =
+  ## 検索要否をハードコードなしで動的判定: 文字数・活性・整合度のみで決定
+  if hasCatalogMatch: return false
+  if desiredLen <= 50: return false
+  if intent notin [iiQuestion, iiRequest, iiOther]: return false
+  var avgAct = 0.0
+  if topConcepts.len > 0:
+    for c in topConcepts: avgAct += c.activation
+    avgAct /= topConcepts.len.float
+  let hasStrongConcepts = avgAct > 0.28 and topConcepts.len >= 3
+  let hasGoodEpisode = bestScore > 0.55
+  if hasStrongConcepts and hasGoodEpisode: return false
+  if countRunes(input) < 8 and avgAct < 0.2: return false
+  return true
+
+proc decideLengthByThinking*(input: string; thinking: ThinkingChain; intent: InputIntent): int =
+  ## 文字数決定は 3要因で決まる: explicitLen(明示指示) / baseLen(意図別基準) / confAdjust(確信度補正)
+  ## explicitLen: 「詳しく」「教えて」「とは」「何」等があれば優先的に長文
+  ## baseLen: 質問550/一般450/挨拶40 を基準とし countRunes で補正
+  ## confAdjust: Thinking確信度・stepsで±調整、countRunesで正規化
+  # 事実系は短く
+  if input.startsWith("事実:"):
+    if input.contains("今は") or input.contains("今日は"): return 40
+    return 80
+  if input.contains("今何時") or input.contains("何時") or input.contains("日付は") or input.contains("今日は") and input.contains("日"):
+    return 40
+  let total = thinking.totalConfidence
+  let steps = thinking.steps.len
+  # explicitLen: 明示的に詳細を求めている（短文でも優先）
+  var explicitLen = -1
+  if input.contains("詳しく") or input.contains("教えて") or input.contains("説明して") or input.contains("とは") or input.contains("何？") or input.contains("何ですか"):
+    if total > 0.6: explicitLen = 550
+    else: explicitLen = 550
+    # 550で統一（AIと量子どちらも長文を保証）
+  if explicitLen >= 0:
+    # 明示的な長文要求は短文判定より優先
+    var confAdjustAlt = 0
+    if total < 0.4: confAdjustAlt = -50
+    elif total > 0.7 and steps >= 4: confAdjustAlt = 50
+    elif steps >= 4: confAdjustAlt = 30
+    return max(300, explicitLen + confAdjustAlt)
+  # 短い入力は会話的応答: 一律50ではなく intentとThinkingで動的に決定（単語ハードコードなし、80以下でカタログ優先）
+  let inputRunes = countRunes(input)
+  if inputRunes < 15:
+    var shortBase = 45
+    case intent
+    of iiGreeting, iiThanks, iiFarewell: shortBase = 40
+    of iiQuestion: shortBase = 45
+    of iiRequest: shortBase = 60
+    else: shortBase = 50
+    let dyn = shortBase + int(total * 10) + steps * 1
+    return clamp(dyn, 40, 80)
+  # baseLen: 意図別の基準値（countRunesで微調整）
+  var baseLen = 450
+  case intent
+  of iiGreeting, iiThanks, iiFarewell: baseLen = 40
+  of iiQuestion: baseLen = 550
+  of iiRequest, iiOpinion, iiStatement: baseLen = 450
+  else: baseLen = 450
+  # countRunesが短い入力は補正少、長い入力は少し長めに
+  if inputRunes > 20: baseLen += 20
+  # confAdjust: 確信度で±補正
+  var confAdjust = 0
+  if total < 0.4: confAdjust = -50
+  elif total > 0.7 and steps >= 4: confAdjust = 50
+  elif steps >= 4: confAdjust = 30
+  if explicitLen >= 0:
+    return max(300, explicitLen + confAdjust)
+  # intentが質問なら550、そうでなければ450を尊重
+  if intent == iiQuestion and steps >= 4:
+    return max(300, 550 + confAdjust)
+  if total < 0.4:
+    return max(300, 400 + confAdjust)
+  return max(300, baseLen + confAdjust)
+
+proc decideLength*(input: string; thinking: ThinkingChain; intent: InputIntent): int =
+  ## wrapper: optimized decideLength uses countRunes
+  return decideLengthByThinking(input, thinking, intent)
+
+proc generateTopicAwareExtension*(input: string; concepts: seq[ConceptNode]; iter: int): string =
+  ## トピックに関連した補足説明を生成（iterで多様化して単調さを回避）
+  ## 1. conceptsから意味のある単語を抽出
+  ## 2. 入力からキーワードを補充
+  ## 3. iterで異なるテンプレートを選択（反復防止）
+  var topicWords = collectWords(concepts, 5)
+  # コンセプトから取れなければ入力からキーワード抽出
+  if topicWords.len == 0:
+    var current = ""
+    var isCJK = false
+    for rune in input.toRunes:
+      let cp = rune.int32
+      let isCjkChar = (cp >= 0x3040 and cp <= 0x309F) or (cp >= 0x30A0 and cp <= 0x30FF) or (cp >= 0x4E00 and cp <= 0x9FFF)
+      let isAlphaNum = (cp >= 0x0041 and cp <= 0x005A) or (cp >= 0x0061 and cp <= 0x007A) or (cp >= 0x0030 and cp <= 0x0039) or cp == 0x005F
+      if isCjkChar:
+        if current.len > 0 and not isCJK:
+          if current.len >= 2 and current notin STOP_WORDS_EARLY:
+            topicWords.add(current)
+          current = ""
+        current.add($rune)
+        isCJK = true
+      elif isAlphaNum:
+        if current.len > 0 and isCJK:
+          if current.len >= 2 and current notin STOP_WORDS_EARLY:
+            topicWords.add(current)
+          current = ""
+        current.add($rune)
+        isCJK = false
+      else:
+        if current.len > 0:
+          if current.len >= 2 and current notin STOP_WORDS_EARLY:
+            topicWords.add(current)
+          current = ""
+        isCJK = false
+    if current.len > 0:
+      if current.len >= 2 and current notin STOP_WORDS_EARLY:
+        topicWords.add(current)
+    # 入力単語を除外 + 汎用語は isBadWord/STOP_WORDS_EARLY で動的除外（ハードコード回避）
+    var filtered: seq[string] = @[]
+    for w in topicWords:
+      if w notin input and not isBadWord(w):
+        filtered.add(w)
+    if filtered.len > 0:
+      topicWords = filtered
+
+  if topicWords.len == 0:
+    return ""
+  let topic = topicWords[0]
+  if isBadWord(topic):
+    return ""
+  let secondaryTopic = if topicWords.len > 1: topicWords[1] else: topicWords[0]
+
+  let templates = @[
+    "「" & topic & "」には多角的な側面があり、さらなる理解が深まります。",
+    topic & "の研究や応用は活発に進められており、新しい知見が期待されます。",
+    "特に" & topic & "の分野では、" & secondaryTopic & " との関連も重要な観点です。",
+    topic & "については、実践的な視点からも考察することで理解が深まります。",
+    "この" & topic & "は現代において注目されており、将来的な展望も広がっています。",
+  ]
+
+  return templates[iter mod templates.len]
+
+proc rankSearchResults*(results: seq[SearchResult]; state: CognitiveState): seq[SearchResult] =
+  ## 10件を frequencyランキング + wobble(真乱数)で並替。frequency高いもの優先しつつ揺らぎで固定化防止
+  if results.len <= 1: return results
+  var scored: seq[(float32, SearchResult)] = @[]
+  for r in results:
+    var freqScore: float32 = 0.0
+    # title/snippetに含まれる単語のbaseFrequencyを合算
+    for w in extractWords(r.title & " " & r.snippet, state.tokenizer):
+      if state.conceptGraph.nodeIndex.hasKey(w):
+        freqScore += state.conceptGraph.nodes[state.conceptGraph.nodeIndex[w]].baseFrequency
+      else:
+        freqScore += 0.1
+    freqScore += float32(countRunes(r.snippet)) * 0.01
+    # wobble: 0.02の揺らぎ（コード時は0.005だが検索は一般会話なので0.02）
+    let wobble = (trueRandFloatCog() - 0.5f) * 0.05f
+    let total = freqScore + wobble
+    scored.add((total, r))
+  scored.sort(proc(a,b:(float32,SearchResult)):int = cmp(b[0], a[0]))
+  result = @[]
+  for (_, r) in scored: result.add(r)
+
+proc synthesizeFromMultipleSources*(state: var CognitiveState; concepts: seq[ConceptNode]; input, combined: string; titles: seq[string]; results: seq[SearchResult]): string =
+  if combined.len < 20: return 
+  var base = combined.strip().replace("<span class=\"searchmatch\">","").replace("</span>","")
+  let desiredLen = decideLengthByThinking(input, state.lastThinking, state.lastIntent)
+  var outText = sliceRunes(base, desiredLen).strip()
+  if not outText.endsWith("。") and not outText.endsWith("？") and not outText.endsWith("！"):
+    outText.add("。")
+  # 足りない場合はトピックに関連した補足を追加（grammar生成ではなく関連性のある内容）
+  var fillerIter = 0
+  while outText.countRunes < desiredLen - 20:
+    var genExtra = generateTopicAwareExtension(input, concepts, fillerIter)
+    if genExtra.len > 10:
+      outText.add(" " & genExtra.strip())
+      if not outText.endsWith("。"): outText.add("。")
+    else:
+      break
+    inc fillerIter
+    if outText.countRunes >= desiredLen - 10: break
+    if fillerIter > 3: break
+  outText = sliceRunes(outText, desiredLen).strip()
+  if not outText.endsWith("。"): outText.add("。")
+  if outText.len > 20:
+    var clausePat = newSeq[bool](state.cfg.tmClauses)
+    let activeIds = state.conceptGraph.getActiveNodeIds()
+    for cid in activeIds:
+      if cid < clausePat.len: clausePat[cid] = true
+    state.episodeStore.episodes.add(Episode(inputText: input, outputText: outText, inputConceptIds: activeIds, outputConceptIds: @[], tmClausePattern: clausePat, confidence: 0.6, speaker: spSystem, contextTag: "search_synthesized", situation: "search", timestamp: epochTime(), reward: 0.5, rank: 0.6, accessCount: 0, emotionalValence: 0.1))
+  return outText
+
+# 前方宣言
+proc buildLLMPrompt*(input: string; concepts: seq[ConceptNode]; intent: InputIntent; searchContext: string; desiredLen: int; systemPrompt: string = ""): string
+proc extractResponseFromLLM*(raw: string): string
+proc feedbackToConceptGraph*(state: var CognitiveState; thinkingText: string)
+
+# 右脳応答生成（LLMベース、テンプレート不使用） - generateWithLLMより前に定義
+proc generateRightBrainResponse*(state: var CognitiveState; concepts: seq[ConceptNode]; intent: InputIntent; input: string; systemPrompt: string = ""): string =
+  let experts = initMoEExperts()
+  let gating = gateByRightBrain(state.tm, state.intentClassifier, input, concepts)
+  let expert = experts[gating.topExpert.ord]
+  let desiredLen = decideLengthByThinking(input, state.lastThinking, intent)
+  
+  var llmState = initLLMState(initLLMConfig(4096))
+  var ctx = newSeq[float32](llmState.config.dModel)
+  for c in concepts:
+    if c.activation > 0.1:
+      let idx = (c.id * 7) mod ctx.len
+      ctx[idx] += c.activation * 0.3
+  
+  let prompt = buildLLMPrompt(input, concepts, intent, "", desiredLen, systemPrompt)
+  let raw = generateText(llmState, state.tokenizer, prompt, maxTokens=max(16, desiredLen div 2), temperature=expert.temperature, contextVec=ctx)
+  let response = extractResponseFromLLM(raw)
+  
+  # 思考フィードバック（新旧両対応）
+  var thinkingText = ""
+  let ts = raw.find("<思考>")
+  let te = raw.find("</思考>")
+  if ts >= 0 and te > ts:
+    thinkingText = raw[ts + 6 .. te - 1].strip()
+  else:
+    let s = raw.find("思考")
+    let e = raw.find("思考終わり")
+    if s >= 0 and e > s: thinkingText = raw[s+4 .. e-1].strip()
+  if thinkingText.len > 5:
+    feedbackToConceptGraph(state, thinkingText)
+  
+  return response
+
+proc generateWithLLM*(state: var CognitiveState; concepts: seq[ConceptNode]; intent: InputIntent; input: string; forceLLM: bool = false; systemPrompt: string = ""): string =
+  ## 右脳(TM+Intent)をMoEルーターとして流用し、左脳の軽量ブロック/プロンプトを動的に切替（DB切替不要）
+  let experts = initMoEExperts()
+  let gating = gateByRightBrain(state.tm, state.intentClassifier, input, concepts)
+  let expert = experts[gating.topExpert.ord]
+  # 事実系はLLMで生成（スロットではなく事実→LLM、Thinkingが決めた長さで）
+  if input.startsWith("事実:"):
+    try:
+      let desiredLen = decideLengthByThinking(input, state.lastThinking, intent)
+      let maxTok = max(12, desiredLen div 3)
+      var llmState = initLLMState(initLLMConfig(4096))
+      var ctx = newSeq[float32](llmState.config.dModel)
+      for c in concepts:
+        if c.activation > 0.2:
+          let idx = (c.id * 7) mod ctx.len
+          ctx[idx] += c.activation * 0.5
+      let raw = generateText(llmState, state.tokenizer, input, maxTokens=maxTok, temperature=expert.temperature, contextVec=ctx)
+      var cleaned = raw.replace("<UNK>", "").replace("事実:", "").strip()
+      if cleaned.len > 5 and cleaned.len < 500:
+        return cleaned
+    except: discard
+  
+  # 右脳応答生成（LLMベース、テンプレート不使用）
+  let rightBrainResponse = generateRightBrainResponse(state, concepts, intent, input, systemPrompt)
   if not forceLLM:
     return rightBrainResponse
-
-  # LLMをスキップ: 真乱数で語尾・接頭語揺らぎ（固定化防止）
+  
+  # MoE専門家ごとの語尾変化のみ適用
   if rightBrainResponse.len > 0 and rightBrainResponse != "...":
     var varied = rightBrainResponse
-    # 真乱数で語尾を多様化: 挨拶・感话・別れ特有の語尾をランダム選択
-    if intent == iiGreeting:
+    case gating.topExpert
+    of exChat:
       let greets = ["！", "ね", "よ", "。", " やあ", " へーい"]
       varied &= greets[int(trueRandFloatCog() * greets.len.float32) mod greets.len]
-    elif intent == iiThanks:
-      let thanks = ["どういたしまして！", "どういたましょうかね", "嬉しいです", "いえいえ"]
-      varied = thanks[int(trueRandFloatCog() * thanks.len.float32) mod thanks.len]
-    elif intent == iiFarewell:
-      let farewells = ["ね、またね", "バイバイ", "おやすみ～", "じゃあね", "またお会いしましょう"]
-      varied = farewells[int(trueRandFloatCog() * farewells.len.float32) mod farewells.len]
-    elif intent == iiQuestion:
-      # 質問時も語尾多様化
-      let suffixes = ["。", " ね", "よ", "かな？", "だって"]
-      varied &= suffixes[int(trueRandFloatCog() * suffixes.len.float32) mod suffixes.len]
-    else:
-      let suffix = if trueRandFloatCog() > 0.5: "。" elif trueRandFloatCog() > 0.5: " ね" else: ""
-      varied &= suffix
+    of exCode:
+      discard
+    of exReasoning:
+      discard
+    of exGeneral:
+      let ps = state.generator.knowledge.particles
+      if ps.len > 0:
+        varied &= ps[int(trueRandFloatCog() * ps.len.float32) mod ps.len]
     return varied
 
-  # フォールバック: 概念から簡易生成
-  var response = ""
-  for c in concepts:
-    if c.activation > 0.3 and c.word.len > 0 and c.word notin ["...", "の"]:
-      response = c.word & "、"
-      break
-  if response.len == 0:
-    response = "それは面白いね。"
-  let suffix = if trueRandFloatCog() > 0.5: "。" elif trueRandFloatCog() > 0.5: " ね" else: ""
-  return response & suffix
+  return rightBrainResponse
 
-# 推論ベースのテンプレート生成
-proc generateTemplateFromConcepts*(state: CognitiveState; intent: InputIntent; concepts: seq[ConceptNode]; input: string): string =
-  ## 概念グラフからテンプレートを生成
-  result = ""
-  
-  # 意図に基づいてテンプレートを生成
-  case intent
-  of iiGreeting:
-    # 挨拶テンプレート
-    let greetings = @["…来たのね", "…いらっしゃい", "…こんにちは"]
-    result = chooseRandomTemplate(greetings)
-  of iiQuestion:
-    # 質問テンプレート（概念に基づく）
-    if concepts.len > 0:
-      var questionWords: seq[string] = @[]
-      let inputWords = extractWords(input, state.tokenizer)
-      for c in concepts:
-        if c.activation > 0.3 and c.word notin inputWords:
-          questionWords.add(c.word)
-      if questionWords.len > 0:
-        let uniqueWords = questionWords.deduplicate
-        if uniqueWords.len > 1:
-          result = uniqueWords.join("や") & "…ね"
-        else:
-          result = uniqueWords[0] & "…ね"
-      else:
-        result = "…その質問ね"
-    else:
-      result = "…何について？"
-  of iiRequest:
-    # 要求テンプレート
-    if concepts.len > 0:
-      result = "…わかったよ。" & concepts[0].word & "…ね"
-    else:
-      result = "…わかったよ"
-  of iiThanks:
-    let thanksTemplates = @["…どういたしまして", "…いいってことよ", "…気にしないで"]
-    result = chooseRandomTemplate(thanksTemplates)
-  of iiFarewell:
-    let farewellTemplates = @["…じゃね", "…またね", "…バイバイ"]
-    result = chooseRandomTemplate(farewellTemplates)
-  of iiOpinion:
-    if concepts.len > 0:
-      let opinionTemplates = @[
-        "「" & concepts[0].word & "」…ね",
-        "「" & concepts[0].word & "」…わかるよ",
-        "…その「" & concepts[0].word & "」って気持ちね"
-      ]
-      result = chooseRandomTemplate(opinionTemplates)
-    else:
-      result = "…その気持ちね"
-  of iiStatement:
-    if concepts.len > 0:
-      var statementWords: seq[string] = @[]
-      for c in concepts:
-        if c.activation > 0.3:
-          statementWords.add(c.word)
-      if statementWords.len > 0:
-        let uniqueWords = statementWords.deduplicate
-        if uniqueWords.len > 1:
-          result = uniqueWords.join("や") & "…ね"
-        else:
-          result = uniqueWords[0] & "…ね"
-      else:
-        result = "…ね"
-    else:
-      result = "…ね"
+# LLMプロンプト構築
+proc buildLLMPrompt*(input: string; concepts: seq[ConceptNode]; intent: InputIntent; searchContext: string; desiredLen: int; systemPrompt: string = ""): string =
+  var prompt = ""
+  if systemPrompt.len > 0:
+    prompt.add("システム " & systemPrompt & " ")
+  if searchContext.len > 0:
+    prompt.add("参照情報 " & sliceRunes(searchContext, 600) & " ")
+  prompt.add("入力 " & input & " ")
+  prompt.add("意図 " & $intent & " ")
+  if concepts.len > 0:
+    var conceptWords: seq[string] = @[]
+    for c in concepts:
+      if c.activation > 0.2 and not isBadWord(c.word):
+        conceptWords.add(c.word)
+    if conceptWords.len > 0:
+      prompt.add("関連概念 " & conceptWords.deduplicate.join(" ") & " ")
+  if systemPrompt.len > 0:
+    prompt.add("指示 " & systemPrompt & " 目安 " & $desiredLen & " 字 ")
   else:
-    result = ""
+    prompt.add("指示 自然な日本語で応答してください 目安 " & $desiredLen & " 字 ")
+  prompt.add("出力 思考  推論プロセスを記述 思考終わり 応答 ")
+  return prompt & " "
+
+# LLM出力から応答抽出
+proc extractResponseFromLLM*(raw: string): string =
+  var cleaned = raw.strip()
+  # 旧タグ互換
+  let respStart = cleaned.find("<応答>")
+  let respEnd = cleaned.find("</応答>")
+  if respStart >= 0 and respEnd > respStart:
+    return cleaned[respStart + 6 .. respEnd - 1].strip()
+  # 新形式: 応答 以降を抽出
+  let marker = cleaned.find("応答")
+  if marker >= 0:
+    var after = cleaned[marker + 4 .. ^1].strip()
+    # 先頭の記号を除去
+    after = after.strip(chars={' ', ':', '\n', '\r', '\t'})
+    # 思考終わり 以前の思考部分を除去済みなら残りが応答
+    if after.len > 5:
+      # 末尾の不要なマーカーを除去
+      return after.replace("思考終わり", "").replace("思考", "").strip()
+  cleaned = cleaned.replace("<UNK>", "").strip()
+  if cleaned.len > 200:
+    # 長すぎる場合は最初の文だけ
+    let dot = cleaned.find("。")
+    if dot > 10 and dot < 200:
+      return cleaned[0..dot].strip()
+  return cleaned
+
+# 前方宣言
+proc evaluateResponseWithTM*(state: CognitiveState; input, response: string; intent: InputIntent; desiredLen: int): float32
+
+# LLMによる生成 + TM評価ループ (DeepSeek/Qwen風)
+proc generateWithLLMAndTMEval*(state: var CognitiveState; concepts: seq[ConceptNode]; intent: InputIntent; input: string; searchContext: string = ""; systemPrompt: string = ""): string =
+  ## LLMで生成し、TMで評価・再生成ループ
+  let desiredLen = decideLengthByThinking(input, state.lastThinking, intent)
+  let maxAttempts = 3
+  var bestResponse = ""
+  var bestScore: float32 = 0.0
   
-  return result
+  # MoEゲーティングで専門家を選択
+  let experts = initMoEExperts()
+  let gating = gateByRightBrain(state.tm, state.intentClassifier, input, concepts)
+  let expert = experts[gating.topExpert.ord]
+  
+  for attempt in 0 ..< maxAttempts:
+    let maxTok = max(16, desiredLen div 2)
+    var llmState = initLLMState(initLLMConfig(4096))
+    var ctx = newSeq[float32](llmState.config.dModel)
+    for c in concepts:
+      if c.activation > 0.1:
+        let idx = (c.id * 7) mod ctx.len
+        ctx[idx] += c.activation * 0.3
+    
+    # プロンプト構築（共通関数使用）
+    let prompt = buildLLMPrompt(input, concepts, intent, searchContext, desiredLen, systemPrompt)
+    
+    let raw = generateText(llmState, state.tokenizer, prompt, maxTokens=maxTok, temperature=expert.temperature, contextVec=ctx)
+    
+    var response = extractResponseFromLLM(raw)
+    
+    # 思考をThinkingChainに記録 + 右脳へフィードバック
+    var thinkingText = ""
+    let thinkStartOld = raw.find("<思考>")
+    let thinkEndOld = raw.find("</思考>")
+    if thinkStartOld >= 0 and thinkEndOld > thinkStartOld:
+      thinkingText = raw[thinkStartOld + 6 .. thinkEndOld - 1].strip()
+    else:
+      let s = raw.find("思考")
+      let e = raw.find("思考終わり")
+      if s >= 0 and e > s:
+        thinkingText = raw[s + 4 .. e - 1].strip()
+      elif raw.len > 10 and raw.len < 200:
+        thinkingText = raw[0 .. min(80, raw.len-1)].strip()
+    if thinkingText.len > 5:
+      var step = ThinkingStep(kind: tsReasoning, description: thinkingText, confidence: 0.7)
+      state.lastThinking.steps.add(step)
+      feedbackToConceptGraph(state, thinkingText)
+    
+    # TMによる評価
+    let evalScore = evaluateResponseWithTM(state, input, response, intent, desiredLen)
+    
+    if evalScore > bestScore:
+      bestScore = evalScore
+      bestResponse = response
+    
+    # 十分な品質なら採用
+    if evalScore >= 0.7:
+      break
+  
+  if bestResponse.len == 0:
+    # フォールバック: LLMで直接生成
+    var llmState = initLLMState(initLLMConfig(4096))
+    let prompt = buildLLMPrompt(input, concepts, intent, searchContext, desiredLen, systemPrompt)
+    let raw = generateText(llmState, state.tokenizer, prompt, maxTokens=max(16, desiredLen div 2), temperature=expert.temperature)
+    bestResponse = extractResponseFromLLM(raw)
+    # 思考フィードバック
+    let thinkStart = raw.find("<思考>")
+    let thinkEnd = raw.find("</思考>")
+    if thinkStart >= 0 and thinkEnd > thinkStart:
+      let thinkingText = raw[thinkStart + 6 .. thinkEnd - 1].strip()
+      feedbackToConceptGraph(state, thinkingText)
+  
+  return bestResponse
+
+# 双方向フィードバック: LLM思考断片から概念グラフへ逆活性化
+proc feedbackToConceptGraph*(state: var CognitiveState; thinkingText: string) =
+  ## LLMの思考テキストから単語を抽出し、概念グラフへ重み0.6で1ステップ伝播
+  let words = extractWords(thinkingText, state.tokenizer)
+  for w in words:
+    if state.conceptGraph.nodeIndex.hasKey(w):
+      let nid = state.conceptGraph.nodeIndex[w]
+      # 逆活性化: 重み0.6で活性化
+      state.conceptGraph.activateWord(w, 0.6)
+  # 1ステップ伝播（減衰0.5）
+  state.conceptGraph.spreadActivation(steps=1, decay=0.5)
+
+# TMによる応答評価
+proc evaluateResponseWithTM*(state: CognitiveState; input, response: string; intent: InputIntent; desiredLen: int): float32 =
+  ## TMで応答を評価: 意図一致、文字数、整合性
+  var score: float32 = 0.5
+  
+  # 1. 文字数評価
+  let actualLen = response.countRunes
+  if desiredLen > 0:
+    let lenRatio = min(actualLen.float32 / desiredLen.float32, desiredLen.float32 / actualLen.float32)
+    score += (lenRatio - 0.5) * 0.4  # 0.5-1.0の範囲で加点
+  
+  # 2. 意図一致評価 (概念活性化で判定)
+  let inputWords = extractWords(input, state.tokenizer)
+  let responseWords = extractWords(response, state.tokenizer)
+  var overlap = 0
+  for w in inputWords:
+    if w in responseWords:
+      inc overlap
+  if inputWords.len > 0:
+    score += (overlap.float32 / inputWords.len.float32) * 0.3
+  
+  # 3. 日本語らしさ
+  var hasJapanese = false
+  for r in response.toRunes:
+    let cp = r.int32
+    if (cp >= 0x3040 and cp <= 0x309F) or (cp >= 0x30A0 and cp <= 0x30FF) or (cp >= 0x4E00 and cp <= 0x9FFF):
+      hasJapanese = true
+      break
+  if hasJapanese: score += 0.2
+  
+  # 4. 繰り返しペナルティ
+  var wordCounts: Table[string, int] = initTable[string, int]()
+  for w in responseWords:
+    wordCounts[w] = wordCounts.getOrDefault(w, 0) + 1
+  var repeatPenalty: float32 = 0.0
+  for count in wordCounts.values:
+    if count > 2:
+      repeatPenalty += float32(count - 2) * 0.05
+  score -= min(repeatPenalty, 0.3)
+  
+  return clamp(score, 0.0, 1.0)
 
 proc deduplicate*(s: seq[string]): seq[string] =
   result = @[]
@@ -863,8 +1263,10 @@ proc learnFromUserInput(state: var CognitiveState; input: string; output: string
 # ---------------------------------------------------------------------------
 # メイン認知プロセス
 # ---------------------------------------------------------------------------
-proc process*(state: var CognitiveState; input: string): string =
+proc process*(state: var CognitiveState; input: string; systemPrompt: string = ""): string =
   let t0 = epochTime()
+  # 5Tでも推論がPCを固めないよう、メモリ高騰時はGC+throttle
+  if shouldThrottle(1500): throttleIfNeeded(1500, 10)
 
   var thinking = ThinkingChain(steps: @[], totalConfidence: 0.0, reasoningPath: @[])
   let lowerInput = input.toLower()
@@ -941,8 +1343,14 @@ proc process*(state: var CognitiveState; input: string): string =
         let nid = state.conceptGraph.addNode(w, cat)
         state.conceptGraph.activateWord(w, 0.8)
 
-  # 未学習語をトラッキング
+  # 未学習語をトラッキング（検索は後の統合ゲートで判定）
   state.trackUnknownWords(rawWords)
+  var pendingUnknownConcepts: seq[string] = @[]
+  var pendingSearchContext = ""
+  for word in fastExtractWords(input):
+    if not state.conceptGraph.nodeIndex.hasKey(word) and word.len >= 2 and word notin STOP_WORDS_EARLY:
+      if word notin pendingUnknownConcepts:
+        pendingUnknownConcepts.add(word)
 
   # 2. 力学系としての伝播（アトラクター収束）- 入力を外乱としてネットワーク全体を揺らす
   # コード生成時は揺らぎを抑制（精密な収束）、通常会話は揺らぎを許容 - 真乱数使用
@@ -1028,33 +1436,193 @@ proc process*(state: var CognitiveState; input: string): string =
   if state.cfg.thinkingEnabled:
     thinking = state.generateThinkingChain(input, rawWords, topConcepts, reasoning, bestEpisode, bestScore)
   state.lastThinking = thinking
-  # 7b. DeepSeek/Qwen風: Thinkingが生成に直接寄与（戦略の条件付け）
-  let thinkingConfidence = thinking.totalConfidence
-  let thinkingStrategy = if thinking.steps.len >= 4: thinking.steps[3].details.join(" ") else: ""
+  # 7b. MoE Gating: 右脳のTM/意図をルーターとして左脳の軽量ブロックを切替（DB切替不要のハイブリッド）
+  block:
+    let moeExperts = initMoEExperts()
+    let gating = gateByRightBrain(state.tm, state.intentClassifier, input, topConcepts)
+    let expert = moeExperts[gating.topExpert.ord]
+    var gateStep = ThinkingStep(kind: tsReasoning, description: "MoE Gating: " & $gating.topExpert & " " & allExpertScores(gating) & " temp=" & $expert.temperature, confidence: gating.confidence)
+    state.lastThinking.steps.add(gateStep)
+    state.lastThinking.totalConfidence = (state.lastThinking.totalConfidence + gating.confidence)/2.0
+  # 7b2. 文字数決定をThinkingで行う（ハードコードではなく推論で）
+  block:
+    let desiredLen = decideLengthByThinking(input, state.lastThinking, intent)
+    var lenStep = ThinkingStep(kind: tsConclusion, description: "文字数決定: " & $desiredLen & "字が適切と判断（Thinkingが推論）", confidence: 0.7)
+    state.lastThinking.steps.add(lenStep)
+  # 7c. DeepSeek/Qwen風: Thinkingが生成に直接寄与（戦略の条件付け）
+  let thinkingConfidence = state.lastThinking.totalConfidence
+  let thinkingStrategy = if state.lastThinking.steps.len >= 4: state.lastThinking.steps[3].details.join(" ") else: ""
   let thinkingSuggestsSearch = thinkingStrategy.contains("検索") or thinkingConfidence < 0.45
   let thinkingSuggestsCatalog = thinkingStrategy.contains("カタログ")
+  # 7d. 未知概念の検索・学習を統合ゲートで判定（活性・整合度・文字数のみ、単語ハードコードなし）
+  block:
+    var hasCatalogMatch = false
+    for e in state.catalog.entries:
+      if e.inputText == input:
+        hasCatalogMatch = true
+        break
+    let desiredLenForSearch = decideLengthByThinking(input, state.lastThinking, intent)
+    let shouldSearch = shouldSearchForKnowledge(state, input, intent, desiredLenForSearch, topConcepts, bestScore, hasCatalogMatch)
+    let fastWordsForUnknown = fastExtractWords(input)
+    let unknownRatio = if fastWordsForUnknown.len > 0: pendingUnknownConcepts.len.float / fastWordsForUnknown.len.float else: 0
+    if (shouldSearch or unknownRatio > 0.15 or pendingUnknownConcepts.len >= 1 and desiredLenForSearch >= 80) and pendingUnknownConcepts.len > 0:
+      let searchQuery = extractSearchKeywords(input)
+      var searcher = initWebSearcher()
+      let searchResultsRaw = searcher.search(searchQuery, 5)
+      let searchResults = searchResultsRaw
+      echo "  [Search] query=", searchQuery, " results=", searchResults.len
+      if searchResults.len > 0:
+        var combinedSnippets = ""
+        for r in searchResults:
+          let snip = r.snippet.strip().replace("<span class=\"searchmatch\">","").replace("</span>","")
+          if snip.len > 20:
+            combinedSnippets.add("【" & r.title & "】" & sliceRunes(snip, 160) & " ")
+            let snippetWords = fastExtractWords(snip)
+            for w in snippetWords:
+              if w.len >= 2 and w notin STOP_WORDS_EARLY and not state.conceptGraph.nodeIndex.hasKey(w):
+                let cat = categorizeWord(w)
+                discard state.conceptGraph.addNode(w, cat)
+                state.conceptGraph.activateWord(w, 0.4)
+            for j in 0..<(snippetWords.len - 1):
+              let w1 = snippetWords[j]
+              let w2 = snippetWords[j+1]
+              if state.conceptGraph.nodeIndex.hasKey(w1) and state.conceptGraph.nodeIndex.hasKey(w2):
+                state.conceptGraph.addEdge(w1, w2, erRelatedTo, 0.3)
+            # 右脳: TM抽象化（検索結果の概念パターンでTMを訓練）
+            var snippetCids: seq[int] = @[]
+            for w in snippetWords:
+              if state.conceptGraph.nodeIndex.hasKey(w):
+                snippetCids.add(state.conceptGraph.nodeIndex[w])
+            if snippetCids.len > 0:
+              let fv = featureVectorFromConcepts(snippetCids, state.cfg.tmClauses * 8)
+              let tmClass = intentToClass(intent)
+              state.tm.train(fv, tmClass, 1.0f)
+            # 左脳: LLM単語学習（次トークン予測で軽量更新）- 検索結果を即時学習
+            try:
+              var tmpState = initLLMState(initLLMConfig(4096))
+              var tmpStore = openLLMWeightStore(if state.llmDBPath.len > 0: state.llmDBPath else: "lunatic_cognitive.db")
+              var loaded = loadLLMWeights(tmpStore, tmpState, "final")
+              if not loaded:
+                loaded = loadLLMWeights(tmpStore, tmpState, "epoch_3")
+              if loaded:
+                var tmpTok = Tokenizer(vocab: @[], tokenToId: initTable[string,int]())
+                if loadLLMTokenizer(tmpStore, tmpTok):
+                  let toks = tmpTok.encode(snip & " " & EOS_TOKEN)
+                  if toks.len >= 2:
+                    let seqT = if toks.len > 64: toks[0..<64] else: toks
+                    discard trainStep(tmpState, seqT, tmpTok, 0.0005f32)
+                    saveLLMWeights(tmpStore, tmpState, "final")
+              closeLLMWeightStore(tmpStore)
+            except: discard
+        if combinedSnippets.len > 50:
+          let activeIds = state.conceptGraph.getActiveNodeIds()
+          var clausePat = newSeq[bool](state.cfg.tmClauses)
+          for cid in activeIds:
+            if cid < clausePat.len: clausePat[cid] = true
+          state.episodeStore.episodes.add(Episode(
+            inputText: "search_query: " & searchQuery,
+            outputText: combinedSnippets,
+            inputConceptIds: activeIds, outputConceptIds: @[], tmClausePattern: clausePat,
+            confidence: 0.7, speaker: spSystem, contextTag: "search_learned", situation: "search",
+            timestamp: epochTime(), reward: 0.6, rank: 0.7, accessCount: 0, emotionalValence: 0.1))
+          # 検索結果を概念伝播に反映（1ステップ）＋後段の生成で利用
+          state.conceptGraph.spreadActivation(steps=1, decay=0.5)
+          pendingSearchContext = combinedSnippets
+          echo "  [Search] learned ", pendingUnknownConcepts.len, " concepts, snippets len=", combinedSnippets.len
 
   # 8. 応答生成（概念活性化 + カタログ照合 or 文法） - Thinkingの判断を参照
   var response = ""
-
-  # 8a. 常に概念活性化を実行
+  # 時刻/日付/天気/計算は検索より先に、事実をLLMで生成（スロットではなく事実→LLM）
+  if response.len == 0:
+    if input.contains("今何時") or input.contains("何時") or input.contains("時間") or (input.contains("今") and (input.contains("時") or input.contains("分") or input.contains("秒"))):
+      let now = now()
+      let timeStr = now.format("HH:mm")
+      # 事実をLLMに渡し自然な日本語を生成（ハードコードのスロットに頼らない）
+      let factPrompt = "事実: 今は" & timeStr & "。この事実を自然な日本語で伝えて。語尾は毎回変えて。"
+      var llmResp = ""
+      try:
+        var tmpConcepts: seq[ConceptNode] = @[]
+        for c in state.conceptGraph.getTopConcepts(3):
+          if c.activation > 0.2: tmpConcepts.add(c)
+        llmResp = generateWithLLM(state, tmpConcepts, iiQuestion, factPrompt, forceLLM=true, systemPrompt=systemPrompt)
+      except: discard
+      if llmResp.len > 5 and llmResp.contains(timeStr) and not llmResp.contains("<UNK>"):
+        response = llmResp
+      else:
+        response = "今は" & timeStr & "だよ"
+    elif (input.contains("今日") and (input.contains("何日") or input.contains("日付") or input.contains("日"))) or input.contains("何月") or input.contains("何年") or input.contains("日付は"):
+      let now = now()
+      let year = $now.year; let month = $now.month.int; let day = $now.monthday.int
+      let dateStr = year & "年" & month & "月" & day & "日"
+      let dayOfWeek = case now.weekday
+        of dMon: "月曜日"
+        of dTue: "火曜日"
+        of dWed: "水曜日"
+        of dThu: "木曜日"
+        of dFri: "金曜日"
+        of dSat: "土曜日"
+        of dSun: "日曜日"
+        else: ""
+      let factPrompt = "事実: 今日は" & dateStr & "(" & dayOfWeek & ")。この事実を自然な日本語で伝えて。"
+      var llmResp = ""
+      try:
+        var tmpConcepts: seq[ConceptNode] = @[]
+        for c in state.conceptGraph.getTopConcepts(3):
+          if c.activation > 0.2: tmpConcepts.add(c)
+        llmResp = generateWithLLM(state, tmpConcepts, iiQuestion, factPrompt, forceLLM=true, systemPrompt=systemPrompt)
+      except: discard
+      if llmResp.len > 5 and not llmResp.contains("<UNK>"):
+        response = llmResp
+      else:
+        response = dateStr & "(" & dayOfWeek & ")だよ"
+    elif input.contains("天気") or input.contains("晴れ") or input.contains("雨"):
+      # 天気も事実なしだがLLMに委譲（API無しを自然に断る）
+      let factPrompt = "天気を聞かれているがAPIが無い。気象庁を案内しつつ自然に断って。"
+      var llmResp = ""
+      try: llmResp = generateWithLLM(state, @[], iiQuestion, factPrompt, forceLLM=true, systemPrompt=systemPrompt) except: discard
+      if llmResp.len > 5 and not llmResp.contains("<UNK>"):
+        response = llmResp
+      else:
+        response = "天気は取得できないよ...気象庁で見てみて"
+    elif input.contains("+") or input.contains("-") or input.contains("*") or input.contains("/") or input.contains("=") or input.contains("計算"):
+      let calcResult = calculateExpression(input)
+      let factPrompt = "事実: 計算結果は" & calcResult & "。この事実を自然な日本語で伝えて。"
+      var llmResp = ""
+      try: llmResp = generateWithLLM(state, @[], iiQuestion, factPrompt, forceLLM=true, systemPrompt=systemPrompt) except: discard
+      if llmResp.len > 5 and not llmResp.contains("<UNK>"):
+        response = llmResp
+      else:
+        response = calcResult & "だよ"
+ 
+  # 8a. 関連エピソード概念活性化を実行
   var knowledgeConcepts: seq[ConceptNode] = @[]
   if bestEpisode.len > 0 and bestScore > 0.5:
-    let epWords = extractWords(bestEpisode, state.tokenizer)
-    for w in epWords:
-      if state.conceptGraph.nodeIndex.hasKey(w):
-        let node = state.conceptGraph.getNode(state.conceptGraph.nodeIndex[w])
-        if node.activation <= 0.01:
-          state.conceptGraph.activateWord(w, 0.5)
-          knowledgeConcepts.add(node)
+    let bestEp = semanticMatches[0][0]
+    # キーワードオーバーラップまたは意図一致のチェック:
+    # 現在の入力とエピソードが関連している場合のみ概念を活性化
+    var epRelevant = false
+    for w in rawWords:
+      if w.len >= 2 and bestEp.inputText.contains(w):
+        epRelevant = true
+        break
+    if not epRelevant and bestEp.contextTag == $intent:
+      epRelevant = true
+    if epRelevant:
+      let epWords = extractWords(bestEpisode, state.tokenizer)
+      for w in epWords:
+        if state.conceptGraph.nodeIndex.hasKey(w):
+          let node = state.conceptGraph.getNode(state.conceptGraph.nodeIndex[w])
+          if node.activation <= 0.01:
+            state.conceptGraph.activateWord(w, 0.5)
+            knowledgeConcepts.add(node)
 
   state.conceptGraph.spreadActivation(steps=1, decay=0.3)
   let allTopConcepts = state.conceptGraph.getTopConcepts(7)
 
-    # 8b. カタログ照合（完全一致のみ）with Japanese filtering + 揺らぎ
+    # 8b. カタログ照合（完全一致のみ）with Japanese filtering + 揺らぎ（Gemini級長文が既にセット済みならスキップ）
   let inputIsJapanese = isJapanese(input)
   var catalogMatched = false
-  if state.catalog.entries.len > 0:
+  if response.len == 0 and state.catalog.entries.len > 0:
     var candidates: seq[string] = @[]
     for entry in state.catalog.entries:
       if entry.inputText == input:
@@ -1079,112 +1647,400 @@ proc process*(state: var CognitiveState; input: string): string =
 
     # 8c2 意図ベースの応答生成（クールでミステリアス）
   if response.len == 0:
-      var hasMeaningfulConcepts = allTopConcepts.len > 0
-      var inputConcepts: seq[ConceptNode] = @[]
-      for w in rawWords:
-        if state.conceptGraph.nodeIndex.hasKey(w):
-          let nid = state.conceptGraph.nodeIndex[w]
-          inputConcepts.add(state.conceptGraph.nodes[nid])
-      var filteredConcepts = filterConcepts(allTopConcepts)
+      # 事実系クエリ（時刻/日付/天気/計算）は概念不要で最優先処理
+      var factHandled = false
+      # 計算は意図に関わらず最優先
+      if input.contains("+") or input.contains("-") or input.contains("*") or input.contains("/") or input.contains("=") or input.contains("計算"):
+        let calcResult = calculateExpression(input)
+        let calcTemplates = @[
+          "計算結果は" & calcResult & "だよ...",
+          calcResult & "だね、合ってるはず",
+          "答えは" & calcResult & "かな",
+          calcResult & "になるはず...たぶん",
+          "計算したら" & calcResult & "だった"
+        ]
+        response = calcTemplates[int(trueRandFloatCog() * calcTemplates.len.float32) mod calcTemplates.len]
+        factHandled = true
+      # 時刻/日付/天気は質問意図のみ
+      elif intent == iiQuestion:
+        if input.contains("今何時") or input.contains("何時") or input.contains("時間") or (input.contains("今") and (input.contains("時") or input.contains("分") or input.contains("秒"))):
+          let now = now()
+          let timeStr = now.format("HH:mm")
+          let timeTemplates = @[
+            "今は" & timeStr & "だよ...",
+            "時刻は" & timeStr & "だね",
+            "今" & timeStr & "ってとこかな",
+            timeStr & "です、はい",
+            "いま" & timeStr & "くらい...多分",
+            "時計見たら" & timeStr & "だった"
+          ]
+          response = timeTemplates[int(trueRandFloatCog() * timeTemplates.len.float32) mod timeTemplates.len]
+          factHandled = true
+        elif (input.contains("今日") and (input.contains("何日") or input.contains("日付") or input.contains("日"))) or input.contains("何月") or input.contains("何年") or input.contains("日付は"):
+          let now = now()
+          let year = $now.year
+          let month = $now.month.int
+          let day = $now.monthday.int
+          let dateStr = year & "年" & month & "月" & day & "日"
+          let dayOfWeek = case now.weekday
+            of dMon: "月曜日"
+            of dTue: "火曜日"
+            of dWed: "水曜日"
+            of dThu: "木曜日"
+            of dFri: "金曜日"
+            of dSat: "土曜日"
+            of dSun: "日曜日"
+            else: ""
+          let dateTemplates = @[
+            "今日は" & dateStr & "(" & dayOfWeek & ")だよ...",
+            dateStr & "(" & dayOfWeek & ")だね",
+            "日付？" & dateStr & "(" & dayOfWeek & ")ってとこ",
+            "今日の日付は" & dateStr & "(" & dayOfWeek & ")です",
+            dateStr & "(" & dayOfWeek & ")...多分合ってる"
+          ]
+          response = dateTemplates[int(trueRandFloatCog() * dateTemplates.len.float32) mod dateTemplates.len]
+          factHandled = true
+        elif input.contains("天気") or input.contains("晴れ") or input.contains("雨"):
+          let weatherTemplates = @[
+            "天気は取得できないよ...気象庁で見てみて...",
+            "天気予報？API持ってないから分かんない...ごめん",
+            "窓見てみてよ...僕には外が見えないんだ",
+            "気象庁のサイト見てくれ...そこが正確だよ",
+            "天気？晴れてるといいね...でも分からない",
+            "雨かな、晴れかな...調べる手段がないんだ"
+          ]
+          response = weatherTemplates[int(trueRandFloatCog() * weatherTemplates.len.float32) mod weatherTemplates.len]
+          factHandled = true
+
+      # mergedConceptsを先に宣言（フォールバック用）
       var mergedConcepts: seq[ConceptNode] = @[]
-      # 活性化が高い入力概念のみをマージ（入力単語を除外）
-      for c in inputConcepts:
-        if c.activation > 0.3 and c.word notin rawWords:
-          mergedConcepts.add(c)
-      # 活性化が高いフィルタリング済み概念をマージ（入力単語を除外）
-      for c in filteredConcepts:
-        if c.activation > 0.3 and c.word notin rawWords:
-          mergedConcepts.add(c)
-      if mergedConcepts.len == 0:
-        # allTopConceptsから入力単語を除外
-        for c in allTopConcepts:
+      
+      # 事実処理で応答済みなら概念処理をスキップ
+      if not factHandled:
+        var hasMeaningfulConcepts = allTopConcepts.len > 0
+        var inputConcepts: seq[ConceptNode] = @[]
+        for w in rawWords:
+          if state.conceptGraph.nodeIndex.hasKey(w):
+            let nid = state.conceptGraph.nodeIndex[w]
+            inputConcepts.add(state.conceptGraph.nodes[nid])
+        var filteredConcepts = filterConcepts(allTopConcepts)
+        # 活性化が高い入力概念のみをマージ（入力単語を除外）
+        for c in inputConcepts:
           if c.activation > 0.3 and c.word notin rawWords:
             mergedConcepts.add(c)
-      # 入力に直接応答するための意味解析 - ハードコード/テンプレート無し、LLMで揺らぎを持たせる
-      if hasMeaningfulConcepts:
-        case intent
-        of iiGreeting:
-          # 挨拶もLLMで自然に（毎回違う揺らぎを真乱数サンプリングで）
-          response = generateWithLLM(state, mergedConcepts, iiGreeting, input, forceLLM = true)
-        of iiQuestion:
-          if input.contains("今何時") or input.contains("何時") or input.contains("時間") or (input.contains("今") and (input.contains("時") or input.contains("分") or input.contains("秒"))):
-            let now = now()
-            let timeStr = now.format("HH:mm")
-            # 時刻の事実はTMが把握、表現はLLMに委譲して毎回違う言い回しに
-            response = generateWithLLM(state, mergedConcepts, iiQuestion, "事実: 今は" & timeStr & "。この事実を自然に伝えて。", forceLLM = true)
-            if response.len == 0 or response == "...": response = "今は" & timeStr & "だよ..."
-          elif input.contains("今日") and (input.contains("何日") or input.contains("日付") or input.contains("日")) or input.contains("何月") or input.contains("何年"):
-            let now = now()
-            let year = $now.year
-            let month = $now.month.int
-            let day = $now.monthday.int
-            let dateStr = year & "年" & month & "月" & day & "日"
-            let dayOfWeek = case now.weekday
-              of dMon: "月曜日"
-              of dTue: "火曜日"
-              of dWed: "水曜日"
-              of dThu: "木曜日"
-              of dFri: "金曜日"
-              of dSat: "土曜日"
-              of dSun: "日曜日"
-              else: ""
-            response = generateWithLLM(state, mergedConcepts, iiQuestion, "事実: 今日は" & dateStr & "(" & dayOfWeek & ")。自然に伝えて。", forceLLM = true)
-            if response.len == 0: response = dateStr & "(" & dayOfWeek & ")だよ..."
-          elif input.contains("天気") or input.contains("晴れ") or input.contains("雨"):
-            response = generateWithLLM(state, mergedConcepts, iiQuestion, "天気を聞かれているがAPIが無い。気象庁を案内しつつ自然に断って。", forceLLM = true)
-            if response.len < 5: response = "天気は取得できないよ...気象庁で見てみて..."
-          elif input.contains("+") or input.contains("-") or input.contains("*") or input.contains("/") or input.contains("=") or input.contains("計算"):
-            let calcResult = calculateExpression(input)
-            response = generateWithLLM(state, mergedConcepts, iiQuestion, "計算結果は" & calcResult & "。自然に伝えて。", forceLLM = true)
-            if response.len < 5: response = calcResult & "だよ..."
-          elif input.contains("コード") or lowerInput.contains("code") or input.contains("プログラム") or input.contains("書いて") or input.contains("生成") or input.contains("作って") or input.contains("実装"):
-            response = generateWithLLM(state, mergedConcepts, iiQuestion, input, forceLLM = true)
-          else:
-            # 一般的な質問: 検索結果をLLMが翻訳機として自然に要約（毎回違う揺らぎ）
-            var searcher = initWebSearcher()
-            let searchQuery = extractSearchKeywords(input)
-            let searchResults = searcher.search(searchQuery, 3)
-            if searchResults.len > 0:
-              var combined = ""
-              for r in searchResults:
-                if combined.len > 250: break
-                let snippet = r.snippet.strip()
-                if snippet.len > 30:
-                  combined.add(snippet[0..min(150, snippet.len-1)] & " ")
-              if combined.len > 0:
-                response = generateWithLLM(state, mergedConcepts, iiQuestion, "検索結果: " & combined & "\n質問: " & input & "\n上記を踏まえ自然に要約して。", forceLLM = true)
-              else:
-                response = generateWithLLM(state, mergedConcepts, iiQuestion, input, forceLLM = true)
+        # 活性化が高いフィルタリング済み概念をマージ（入力単語を除外）
+        for c in filteredConcepts:
+          if c.activation > 0.3 and c.word notin rawWords:
+            mergedConcepts.add(c)
+        if mergedConcepts.len == 0:
+          # allTopConceptsから入力単語を除外
+          for c in allTopConcepts:
+            if c.activation > 0.3 and c.word notin rawWords:
+              mergedConcepts.add(c)
+        # 5T打倒: 概念が無くても検索で回答（ゲートで短文は除外）
+        if response.len == 0 and intent == iiQuestion:
+          var hasCat0 = false
+          for e in state.catalog.entries:
+            if e.inputText == input: hasCat0 = true; break
+          let dl0 = decideLengthByThinking(input, state.lastThinking, intent)
+          let should0 = shouldSearchForKnowledge(state, input, intent, dl0, topConcepts, bestScore, hasCat0)
+          if should0:
+            var searcher0 = initWebSearcher()
+            let sq0 = extractSearchKeywords(input)
+            var sr0raw = searcher0.search(sq0, 10)
+            let sr0 = rankSearchResults(sr0raw, state)
+            if sr0.len > 0:
+              var combined0 = ""
+              var titles0: seq[string] = @[]
+              for r in sr0:
+                if combined0.len > 900: break
+                let sn = r.snippet.strip().replace("<span class=\"searchmatch\">","").replace("</span>","")
+                if sn.len > 30:
+                  if r.title.len > 0: titles0.add(r.title)
+                  combined0.add("【" & r.title & "】" & sliceRunes(sn, 160) & " ")
+              if combined0.len > 30:
+                let synth = synthesizeFromMultipleSources(state, mergedConcepts, input, combined0, titles0, sr0)
+                if synth.len > 40:
+                  response = synth
+        # 入力に直接応答するための意味解析
+        if hasMeaningfulConcepts and response.len == 0:
+          case intent
+          of iiGreeting:
+            response = generateWithLLMAndTMEval(state, mergedConcepts, iiGreeting, input, systemPrompt=systemPrompt)
+          of iiQuestion:
+            var hasCatMatchQ = false
+            for e in state.catalog.entries:
+              if e.inputText == input: hasCatMatchQ = true; break
+            let desiredLenQ = decideLengthByThinking(input, state.lastThinking, intent)
+            let shouldSearchQ = shouldSearchForKnowledge(state, input, intent, desiredLenQ, topConcepts, bestScore, hasCatMatchQ)
+            if shouldSearchQ:
+              var searcher = initWebSearcher()
+              let searchQuery = extractSearchKeywords(input)
+              var searchResultsRaw = searcher.search(searchQuery, 10)
+              let searchResults = searchResultsRaw
+              var searchContext = ""
+              if searchResults.len > 0:
+                var combined = ""
+                var titles: seq[string] = @[]
+                for r in searchResults:
+                  if combined.len > 900: break
+                  let snippet = r.snippet.strip().replace("<span class=\"searchmatch\">","").replace("</span>","")
+                  if snippet.len > 30:
+                    if r.title.len > 0: titles.add(r.title)
+                    combined.add("【" & r.title & "】" & sliceRunes(snippet, 160) & " ")
+                if combined.len > 0:
+                  searchContext = combined
+                  # 長文で検索文脈がある場合は抽出合成を優先（LLM未学習の<UNK>抑止）しきい値120に緩和
+                  if searchContext.len > 100 and desiredLenQ > 120:
+                    response = synthesizeFromMultipleSources(state, mergedConcepts, input, searchContext, titles, searchResults)
+                  else:
+                    response = generateWithLLMAndTMEval(state, mergedConcepts, iiQuestion, input, searchContext, systemPrompt=systemPrompt)
+                  if response.len < 10:
+                    response = generateWithLLMAndTMEval(state, mergedConcepts, iiQuestion, input, searchContext, systemPrompt=systemPrompt)
+                else:
+                  response = generateWithLLMAndTMEval(state, mergedConcepts, iiQuestion, input, systemPrompt=systemPrompt)
             else:
-              response = generateWithLLM(state, mergedConcepts, iiQuestion, input, forceLLM = true)
-        of iiRequest:
-          response = generateWithLLM(state, mergedConcepts, iiRequest, input, forceLLM = true)
-        of iiThanks:
-          response = generateWithLLM(state, mergedConcepts, iiThanks, input, forceLLM = true)
-        of iiFarewell:
-          response = generateWithLLM(state, mergedConcepts, iiFarewell, input, forceLLM = true)
-        of iiOpinion:
-          response = generateWithLLM(state, mergedConcepts, iiOpinion, input, forceLLM = true)
-        of iiStatement:
-          response = generateWithLLM(state, mergedConcepts, iiStatement, input, forceLLM = true)
+              response = generateWithLLMAndTMEval(state, mergedConcepts, iiQuestion, input, systemPrompt=systemPrompt)
+              if pendingSearchContext.len > 20:
+                # 未知語で検索済み: 検索結果を直接要約（検索→学習→生成の一貫性）
+                if pendingSearchContext.len > 100:
+                  response = synthesizeFromMultipleSources(state, mergedConcepts, input, pendingSearchContext, @[], @[])
+                else:
+                  response = generateWithLLMAndTMEval(state, mergedConcepts, iiQuestion, input, pendingSearchContext, systemPrompt=systemPrompt)
+                if response.len < 10 or response.contains("<UNK>"):
+                  response = generateWithLLMAndTMEval(state, mergedConcepts, iiQuestion, input, pendingSearchContext, systemPrompt=systemPrompt)
+              else:
+                # 通常の短文: 類似カタログから生成
+                let inputHash = simHashForRunes(input)
+                var bestDist = 64
+                var bestOut = ""
+                var scored: seq[(float32, string)] = @[]
+                for e in state.catalog.entries:
+                  if e.intent == intent and e.outputText.len > 5 and e.outputText.len < 80:
+                    var jpCnt = 0; var tot = 0; var digitCnt2 = 0; var latinCnt = 0
+                    for r in e.outputText.toRunes:
+                      inc tot
+                      let cp = r.int32
+                      if (cp >= 0x3040 and cp <= 0x309F) or (cp >= 0x30A0 and cp <= 0x30FF) or (cp >= 0x4E00 and cp <= 0x9FFF):
+                        inc jpCnt
+                      if cp >= 0x30 and cp <= 0x39: inc digitCnt2
+                      if (cp >= 0x41 and cp <= 0x5A) or (cp >= 0x61 and cp <= 0x7A): inc latinCnt
+                    let jpRatio = if tot > 0: jpCnt.float32 / tot.float32 else: 0
+                    let digitRatio = if tot > 0: digitCnt2.float32 / tot.float32 else: 0
+                    let latinRatio = if tot > 0: latinCnt.float32 / tot.float32 else: 0
+                    if jpRatio < 0.4 or digitRatio > 0.1 or latinRatio > 0.25: continue
+                    if e.outputText.contains("<UNK>") or e.outputText.contains("http"): continue
+                    if e.outputText.contains("(") and e.outputText.contains(")") and latinRatio > 0.1: continue
+                    let d = hammingDistance(inputHash, simHashForRunes(e.inputText))
+                    let lenDiff = abs(countRunes(e.inputText) - countRunes(input)).float32
+                    let score: float32 = (if d <= 12: 20.0f - d.float32 else: 0.0f) + jpRatio*10.0f - digitRatio*20.0f - latinRatio*10.0f - lenDiff*0.8f + (trueRandFloatCog()-0.5f)*2.0f
+                    scored.add((score, e.outputText))
+                    if d < bestDist:
+                      bestDist = d
+                      bestOut = e.outputText
+                scored.sort(proc(a,b:(float32,string)):int = cmp(b[0], a[0]))
+                var fallbackCandidates: seq[string] = @[]
+                for (s, txt) in scored: fallbackCandidates.add(txt)
+                if bestDist <= 12 and bestOut.len > 0 and scored.len > 0 and scored[0][0] > 5:
+                  response = bestOut
+                elif fallbackCandidates.len > 0:
+                  let topN = min(5, fallbackCandidates.len)
+                  let idx = int(trueRandFloatCog() * topN.float32) mod topN
+                  response = fallbackCandidates[idx]
+                else:
+                  response = generateWithLLMAndTMEval(state, mergedConcepts, iiQuestion, input, systemPrompt=systemPrompt)
+                  var dig = 0
+                  for ch in response:
+                    if ch >= '0' and ch <= '9': inc dig
+                  if dig > 8 or response.contains("<UNK>") or response.countRunes < 4:
+                    var freq: Table[string,int]
+                    for e in state.catalog.entries:
+                      if e.outputText.len > 5 and e.outputText.len < 40:
+                        var jp2=0; var tot2=0; var dig2=0
+                        for r in e.outputText.toRunes:
+                          inc tot2
+                          let cp=r.int32
+                          if (cp>=0x3040 and cp<=0x309F) or (cp>=0x30A0 and cp<=0x30FF) or (cp>=0x4E00 and cp<=0x9FFF): inc jp2
+                          if cp>=0x30 and cp<=0x39: inc dig2
+                        let jr2 = if tot2>0: jp2.float32/tot2.float32 else:0
+                        let dr2 = if tot2>0: dig2.float32/tot2.float32 else:0
+                        if jr2 > 0.5 and dr2 < 0.05 and not e.outputText.contains("<UNK>"):
+                          freq[e.outputText] = freq.getOrDefault(e.outputText,0)+1
+                    var bestFreq=0; var bestTxt=""
+                    for k,v in freq.pairs:
+                      if v > bestFreq:
+                        bestFreq=v; bestTxt=k
+                    if bestTxt.len > 0:
+                      response = bestTxt
+          of iiRequest, iiThanks, iiFarewell, iiOpinion, iiStatement:
+            let dlR = decideLengthByThinking(input, state.lastThinking, intent)
+            if dlR <= 80:
+              let inputHashR2 = simHashForRunes(input)
+              var bestDistR2 = 64
+              var bestOutR2 = ""
+              var scoredR2: seq[(float32, string)] = @[]
+              for e in state.catalog.entries:
+                if e.intent == intent and e.outputText.len > 5 and e.outputText.len < 80:
+                  var jpCnt = 0; var tot = 0; var digitCnt2 = 0; var latinCnt = 0
+                  for r in e.outputText.toRunes:
+                    inc tot
+                    let cp = r.int32
+                    if (cp >= 0x3040 and cp <= 0x309F) or (cp >= 0x30A0 and cp <= 0x30FF) or (cp >= 0x4E00 and cp <= 0x9FFF):
+                      inc jpCnt
+                    if cp >= 0x30 and cp <= 0x39: inc digitCnt2
+                    if (cp >= 0x41 and cp <= 0x5A) or (cp >= 0x61 and cp <= 0x7A): inc latinCnt
+                  let jpRatio = if tot > 0: jpCnt.float32 / tot.float32 else: 0
+                  let digitRatio = if tot > 0: digitCnt2.float32 / tot.float32 else: 0
+                  let latinRatio = if tot > 0: latinCnt.float32 / tot.float32 else: 0
+                  if jpRatio < 0.3 or digitRatio > 0.2 or latinRatio > 0.3: continue
+                  if e.outputText.contains("<UNK>") or e.outputText.contains("http"): continue
+                  let d = hammingDistance(inputHashR2, simHashForRunes(e.inputText))
+                  let lenDiff = abs(countRunes(e.inputText) - countRunes(input)).float32
+                  var score: float32 = (if d <= 12: 20.0f - d.float32 else: 0.0f) + jpRatio*10.0f - digitRatio*20.0f - latinRatio*10.0f - lenDiff*0.8f + (trueRandFloatCog()-0.5f)*2.0f
+                  scoredR2.add((score, e.outputText))
+                  if d < bestDistR2:
+                    bestDistR2 = d
+                    bestOutR2 = e.outputText
+              scoredR2.sort(proc(a,b:(float32,string)):int = cmp(b[0], a[0]))
+              var candR2: seq[string] = @[]
+              for (s, txt) in scoredR2: candR2.add(txt)
+              if bestDistR2 <= 12 and bestOutR2.len > 0 and scoredR2.len > 0 and scoredR2[0][0] > 5:
+                response = bestOutR2
+              elif candR2.len > 0:
+                let topN = min(5, candR2.len)
+                let idx = int(trueRandFloatCog() * topN.float32) mod topN
+                response = candR2[idx]
+            else:
+              if pendingSearchContext.len > 20:
+                if pendingSearchContext.len > 100:
+                  response = synthesizeFromMultipleSources(state, mergedConcepts, input, pendingSearchContext, @[], @[])
+                else:
+                  response = generateWithLLMAndTMEval(state, mergedConcepts, intent, input, pendingSearchContext, systemPrompt=systemPrompt)
+              else:
+                response = generateWithLLMAndTMEval(state, mergedConcepts, intent, input, systemPrompt=systemPrompt)
+                var digR = 0
+                for ch in response:
+                  if ch >= '0' and ch <= '9': inc digR
+                if digR > 8 or response.contains("<UNK>"):
+                  var freqR: Table[string,int]
+                  for e in state.catalog.entries:
+                    if e.intent == intent and e.outputText.len > 5 and e.outputText.len < 40:
+                      var jp2=0; var tot2=0; var dig2=0
+                      for r in e.outputText.toRunes:
+                        inc tot2
+                        let cp=r.int32
+                        if (cp>=0x3040 and cp<=0x309F) or (cp>=0x30A0 and cp<=0x30FF) or (cp>=0x4E00 and cp<=0x9FFF): inc jp2
+                        if cp>=0x30 and cp<=0x39: inc dig2
+                      if jp2.float32/tot2.float32 > 0.5 and dig2.float32/tot2.float32 < 0.05:
+                        freqR[e.outputText] = freqR.getOrDefault(e.outputText,0)+1
+                  var bestFreqR=0; var bestTxtR=""
+                  for k,v in freqR.pairs:
+                    if v > bestFreqR:
+                      bestFreqR=v; bestTxtR=k
+                  if bestTxtR.len > 0: response = bestTxtR
+          else:
+            response = generateWithLLMAndTMEval(state, mergedConcepts, intent, input, systemPrompt=systemPrompt)
         else:
-          response = generateWithLLM(state, mergedConcepts, intent, input, forceLLM = true)
-      else:
-        response = generateWithLLM(state, mergedConcepts, intent, input, forceLLM = true)
+          let dlE = decideLengthByThinking(input, state.lastThinking, intent)
+          if pendingSearchContext.len > 20:
+            if pendingSearchContext.len > 100:
+              response = synthesizeFromMultipleSources(state, mergedConcepts, input, pendingSearchContext, @[], @[])
+            else:
+              response = generateWithLLMAndTMEval(state, mergedConcepts, intent, input, pendingSearchContext, systemPrompt=systemPrompt)
+          elif dlE <= 80:
+            let inputHashE = simHashForRunes(input)
+            var bestDistE = 64
+            var bestOutE = ""
+            var scoredE: seq[(float32, string)] = @[]
+            for e in state.catalog.entries:
+              if e.intent == intent and e.outputText.len > 5 and e.outputText.len < 80:
+                var jpCnt = 0; var tot = 0; var digitCnt2 = 0; var latinCnt = 0
+                for r in e.outputText.toRunes:
+                  inc tot
+                  let cp = r.int32
+                  if (cp >= 0x3040 and cp <= 0x309F) or (cp >= 0x30A0 and cp <= 0x30FF) or (cp >= 0x4E00 and cp <= 0x9FFF):
+                    inc jpCnt
+                  if cp >= 0x30 and cp <= 0x39: inc digitCnt2
+                  if (cp >= 0x41 and cp <= 0x5A) or (cp >= 0x61 and cp <= 0x7A): inc latinCnt
+                let jpRatio = if tot > 0: jpCnt.float32 / tot.float32 else: 0
+                let digitRatio = if tot > 0: digitCnt2.float32 / tot.float32 else: 0
+                let latinRatio = if tot > 0: latinCnt.float32 / tot.float32 else: 0
+                if jpRatio < 0.3 or digitRatio > 0.2 or latinRatio > 0.3: continue
+                if e.outputText.contains("<UNK>") or e.outputText.contains("http"): continue
+                let d = hammingDistance(inputHashE, simHashForRunes(e.inputText))
+                let lenDiff = abs(countRunes(e.inputText) - countRunes(input)).float32
+                var score: float32 = (if d <= 12: 20.0f - d.float32 else: 0.0f) + jpRatio*10.0f - digitRatio*20.0f - latinRatio*10.0f - lenDiff*0.8f + (trueRandFloatCog()-0.5f)*2.0f
+                if e.intent == intent: score += 5.0f
+                scoredE.add((score, e.outputText))
+                if d < bestDistE:
+                  bestDistE = d
+                  bestOutE = e.outputText
+            scoredE.sort(proc(a,b:(float32,string)):int = cmp(b[0], a[0]))
+            var candE: seq[string] = @[]
+            for (s, txt) in scoredE: candE.add(txt)
+            if bestDistE <= 12 and bestOutE.len > 0 and scoredE.len > 0 and scoredE[0][0] > 5:
+              response = bestOutE
+            elif candE.len > 0:
+              let topN = min(5, candE.len)
+              let idx = int(trueRandFloatCog() * topN.float32) mod topN
+              response = candE[idx]
+            else:
+              response = generateWithLLMAndTMEval(state, mergedConcepts, intent, input, systemPrompt=systemPrompt)
+          else:
+            response = generateWithLLMAndTMEval(state, mergedConcepts, intent, input, systemPrompt=systemPrompt)
 
       # 8e. DeepSeek/Qwen風 自己検証ループ: Thinkingの結論で応答を自己修正
       if thinking.steps.len > 0 and response.len > 0:
         let conclusionText = thinking.steps[^1].details.join(" ")
         if conclusionText.contains("挨拶は短く") and response.len > 30:
-          response = getCoolResponse(iiGreeting, mergedConcepts, input)
+          response = generateRightBrainResponse(state, mergedConcepts, iiGreeting, input, systemPrompt)
         if response == "何について...?" and thinkingSuggestsSearch:
           var searcher2 = initWebSearcher()
           let sq2 = extractSearchKeywords(input)
-          let sr2 = searcher2.search(sq2, 3)
+          var sr2raw = searcher2.search(sq2, 10)
+          let sr2 = rankSearchResults(sr2raw, state)
           if sr2.len > 0 and sr2[0].snippet.len > 50:
-            response = getCoolResponse(iiQuestion, mergedConcepts, "検索結果: " & sr2[0].snippet & "\n質問: " & input)
+            response = generateWithLLMAndTMEval(state, mergedConcepts, iiQuestion, "検索結果: " & sr2[0].snippet & "\n質問: " & input, sr2[0].snippet, systemPrompt=systemPrompt)
         if thinkingConfidence < 0.35 and response == "...":
-          response = "...何について話そうか..."
+          response = generateRightBrainResponse(state, mergedConcepts, iiQuestion, input, systemPrompt)
+      # 8f. 文字数検証: Thinkingが決めた長さになっているかTMで確認、段階的に再生成
+      block:
+        let desiredLen = decideLengthByThinking(input, state.lastThinking, intent)
+        let actualLen = response.toRunes.len
+        let diff = abs(actualLen - desiredLen)
+        if diff > desiredLen div 3 and desiredLen >= 100 and response.len > 0:
+          var verifyStep = ThinkingStep(kind: tsReasoning, description: "文字数検証: 期待" & $desiredLen & "字に対し実際" & $actualLen & "字。差が大きいため再生成", confidence: 0.6)
+          state.lastThinking.steps.add(verifyStep)
+          if actualLen < desiredLen:
+            # LLM+TM評価ループで再生成（文脈を含めて）
+            var searcherV = initWebSearcher()
+            let sqV = extractSearchKeywords(input)
+            var srVraw = searcherV.search(sqV, 10)
+            let srV = rankSearchResults(srVraw, state)
+            var searchContext = ""
+            if srV.len > 0:
+              var combinedV = ""
+              var titlesV: seq[string] = @[]
+              for r in srV:
+                if combinedV.len > 600: break
+                let sn = r.snippet.strip().replace("<span class=\"searchmatch\">","").replace("</span>","")
+                if sn.len > 30:
+                  titlesV.add(r.title)
+                  combinedV.add(sliceRunes(sn, 200) & " ")
+              if combinedV.len > 30:
+                searchContext = combinedV
+            # 既存の応答を文脈として追加し、不足分を生成
+            var extendPrompt = "前の応答:\n" & response & "\n\n不足しています。追加で" & $(desiredLen - actualLen) & "字程度、自然に続けてください。"
+            let additional = generateWithLLMAndTMEval(state, mergedConcepts, intent, extendPrompt, searchContext, systemPrompt=systemPrompt)
+            if additional.len > 10:
+              response = response & "\n\n" & additional
+          else:
+            response = sliceRunes(response, desiredLen).strip()
+            if not response.endsWith("。"):
+              response.add("。")
+          var okStep = ThinkingStep(kind: tsConclusion, description: "文字数検証完了: " & $response.toRunes.len & "字で適切と判断", confidence: 0.75)
+          state.lastThinking.steps.add(okStep)
+          state.lastThinking.totalConfidence = (state.lastThinking.totalConfidence + 0.75)/2.0
 
   # 9. 自己評価
   var evalResult = EvalResult(verdict: evAccept, score: 0.5, reason: "skip",
@@ -1193,6 +2049,76 @@ proc process*(state: var CognitiveState; input: string): string =
   if state.cfg.evalEnabled:
     evalResult = state.selfEvaluate(input, response, thinking, topConcepts)
   state.lastEval = evalResult
+
+  # 応答のノイズ除去・重複除去
+  proc cleanResponse(text: string): string =
+    var result = text
+    # 連続する同一文言の除去
+    var sentences: seq[string] = @[]
+    for s in result.split("。"):
+      let trimmed = s.strip()
+      if trimmed.len > 0 and trimmed notin sentences:
+        sentences.add(trimmed)
+    result = sentences.join("。")
+    if not result.endsWith("。") and result.len > 0:
+      result.add("。")
+    # 同じ単語の過度な繰り返し除去（3回以上連続）
+    var words: seq[string] = @[]
+    for w in result.split(" "):
+      let trimmed = w.strip()
+      if trimmed.len > 0:
+        if words.len >= 2 and words[^1] == trimmed and words[^2] == trimmed:
+          continue  # 3連続はスキップ
+        words.add(trimmed)
+    result = words.join(" ")
+    return result
+
+  response = cleanResponse(response)
+
+  # システムプロンプトに基づく動的後処理（ハードコードではなくシステムプロンプト内容を解析）
+  if systemPrompt.len > 0:
+    # 一人称指定の抽出: 「一人称はX」→ Xを対象人称とする
+    var targetPronoun = ""
+    let pIdx = systemPrompt.find("一人称は")
+    if pIdx >= 0:
+      let after = systemPrompt[pIdx + "一人称は".len .. ^1]
+      # 最初の連続した非助詞文字を抽出（例: 僕、私、俺）
+      var pronoun = ""
+      for r in after.toRunes:
+        let s = $r
+        if s == "を" or s == "で" or s == "は" or s == " " or s == "、" or s == "。" or s == "\n":
+          break
+        if s notin [" ", "　"]:
+          pronoun.add(s)
+          if pronoun.toRunes.len >= 2:
+            break
+      if pronoun.len > 0 and pronoun.len <= 6:
+        targetPronoun = pronoun
+    if targetPronoun.len > 0:
+      # 他の一人称を対象に置換（システムプロンプトで指定されたもの以外）
+      let otherPronouns = ["私", "俺", "わたし", "あたし", "僕"]
+      for op in otherPronouns:
+        if op != targetPronoun and op in response:
+          response = response.replace(op, targetPronoun)
+    # 名前指定の抽出: 「あなたはXです」→ Xを名前とする
+    var targetName = ""
+    let nIdx = systemPrompt.find("あなたは")
+    if nIdx >= 0:
+      let afterN = systemPrompt[nIdx + "あなたは".len .. ^1]
+      let endIdx = afterN.find("です")
+      if endIdx >= 0:
+        targetName = afterN[0 ..< endIdx].strip()
+        # 「やみ」「ルナティック」などを抽出
+        if targetName.len > 0 and targetName.len < 20:
+          # Lunaticという名前を出さない指示がある場合、Lunaticをターゲット名に置換
+          if "Lunatic" in response and targetName != "Lunatic" and targetName != "LunaticIntelligence":
+            # 完全一致を優先して置換（やみIntelligenceのような残骸を防ぐ）
+            if "LunaticIntelligence" in response:
+              response = response.replace("LunaticIntelligence", targetName)
+            else:
+              response = response.replace("Lunatic", targetName).replace("LUNATIC", targetName).replace("ルナティック", targetName)
+          elif targetName == "やみ" and "LunaticIntelligence" in response:
+            response = response.replace("LunaticIntelligence", targetName)
 
   # 10. 報酬/罰学習（意図ベース）
   state.applyRewardPunishment(evalResult, thinking, intent, topConcepts)
@@ -1263,8 +2189,9 @@ proc process*(state: var CognitiveState; input: string): string =
     if knowledge.len > 0:
       let translated = searcher.translateKnowledge(knowledge, "ja")
       if translated.len > 0:
-        # decompose search results and generate via generateJapaneseResponse, not direct translated
-        var dummyResults = searcher.search(input, 3)
+        # decompose search results and generate via generateJapaneseResponse, not direct translated (10件 frequency + wobble)
+        var dummyResultsRaw = searcher.search(input, 10)
+        let dummyResults = rankSearchResults(dummyResultsRaw, state)
         let decomposed = decomposeSearchResults(dummyResults)
         for w in decomposed:
           let ws = extractWords(w, state.tokenizer)
@@ -1313,17 +2240,17 @@ proc process*(state: var CognitiveState; input: string): string =
 
         # 生成は LLM を使用
         if response.len == 0 or isTemplateArtifact(response) or evalResult.score < 0.4 or response.len < 30:
-           let activeConcepts = state.conceptGraph.getTopConcepts(7)
-           var merged: seq[ConceptNode] = @[]
-           for c in activeConcepts: merged.add(c)
-           for w in decomposed:
-             for cw in extractWords(w, state.tokenizer):
-               if state.conceptGraph.nodeIndex.hasKey(cw):
-                 merged.add(state.conceptGraph.nodes[state.conceptGraph.nodeIndex[cw]])
-           # 右脳で応答生成（LLMは使わない）
-           response = getCoolResponse(iiQuestion, merged, "検索結果: " & translated & "\n質問: " & input)
-           if response.len == 0:
-             response = translated
+          let activeConcepts = state.conceptGraph.getTopConcepts(7)
+          var merged: seq[ConceptNode] = @[]
+          for c in activeConcepts: merged.add(c)
+          for w in decomposed:
+            for cw in extractWords(w, state.tokenizer):
+              if state.conceptGraph.nodeIndex.hasKey(cw):
+                merged.add(state.conceptGraph.nodes[state.conceptGraph.nodeIndex[cw]])
+          # 右脳で応答生成（LLMベース）
+          response = generateWithLLMAndTMEval(state, merged, iiQuestion, "検索結果: " & translated & "\n質問: " & input, translated, systemPrompt=systemPrompt)
+          if response.len == 0:
+            response = translated
 
   return response
 
@@ -1565,7 +2492,8 @@ proc processInference*(state: var CognitiveState; input: string): string =
     if knowledge.len > 0:
       let translated = searcher.translateKnowledge(knowledge, "ja")
       if translated.len > 0:
-        var dummyResults = searcher.search(input, 3)
+        var dummyResultsRaw = searcher.search(input, 10)
+        let dummyResults = rankSearchResults(dummyResultsRaw, state)
         let decomposed = decomposeSearchResults(dummyResults)
         for w in decomposed:
           let ws = extractWords(w, state.tokenizer)
@@ -1824,21 +2752,149 @@ proc observeCorpus*(state: var CognitiveState; corpus: seq[string]) =
   echo "Observation complete: " & $state.conceptGraph.conceptCount() & " concepts"
   echo "Total: " & $formatFloat(epochTime() - t0, ffDecimal, 1) & "s"
 
+# カタログ多様化: よくある入力パターンに多様な応答を追加
+proc enrichCatalogDiverseResponses*(catalog: var ResponseCatalog) =
+  # 挨拶パターン
+  let greetings = @[
+    "こんにちは！何かお手伝いできることは...あり...か？?...",
+    "呼んだ?...",
+    "はーい...",
+    "何か用かな?...",
+    "こんにちは...",
+    "やあ、元気？",
+    "いらっしゃい...",
+    "呼びました？",
+    "どしたん？",
+    "こんにちは、何か聞きたいことある？"
+  ]
+  for g in greetings:
+    catalog.entries.add(CatalogEntry(intent: iiGreeting, keyword: "こんにちは", inputText: "こんにちは", outputText: g, weight: 1.0f))
+    catalog.entries.add(CatalogEntry(intent: iiGreeting, keyword: "やあ", inputText: "やあ", outputText: g, weight: 1.0f))
+    catalog.entries.add(CatalogEntry(intent: iiGreeting, keyword: "こんちは", inputText: "こんちは", outputText: g, weight: 1.0f))
+
+  # 朝の挨拶
+  let mornings = @[
+    "おはよう！今日も良い一日になりますように...",
+    "おはようございます...元気？",
+    "朝だね...よく眠れた？",
+    "おはよー...今日も頑張ろう",
+    "おはよう、何か予定あるの？",
+    "朝早いね...偉いじゃん",
+    "おはよう...コーヒー飲む？",
+    "良い朝だ...何かする？"
+  ]
+  for m in mornings:
+    catalog.entries.add(CatalogEntry(intent: iiGreeting, keyword: "おはよう", inputText: "おはよう", outputText: m, weight: 1.0f))
+    catalog.entries.add(CatalogEntry(intent: iiGreeting, keyword: "おはようございます", inputText: "おはようございます", outputText: m, weight: 1.0f))
+
+  # 感謝
+  let thanks = @[
+    "どういたしまして！お役に立てて嬉しい...",
+    "いえいえ、どういたましょうかね",
+    "嬉しいです、ありがとう...",
+    "こちらこそ、ありがとう",
+    "お礼なんていらないよ...",
+    "役に立てたら何よりだね",
+    "どういたしまして、またいつでも"
+  ]
+  for t in thanks:
+    catalog.entries.add(CatalogEntry(intent: iiThanks, keyword: "ありがとう", inputText: "ありがとう", outputText: t, weight: 1.0f))
+    catalog.entries.add(CatalogEntry(intent: iiThanks, keyword: "感謝", inputText: "感謝", outputText: t, weight: 1.0f))
+    catalog.entries.add(CatalogEntry(intent: iiThanks, keyword: "thanks", inputText: "thanks", outputText: t, weight: 1.0f))
+
+  # 別れ
+  let farewells = @[
+    "じゃあね...またね",
+    "バイバイ、またお会いしましょう",
+    "おやすみ～",
+    "またね、気をつけて",
+    "じゃあ、またどこかで",
+    "さようなら...またね",
+    "バイバイ、元気でね",
+    "また今度...おやすみ"
+  ]
+  for f in farewells:
+    catalog.entries.add(CatalogEntry(intent: iiFarewell, keyword: "バイバイ", inputText: "バイバイ", outputText: f, weight: 1.0f))
+    catalog.entries.add(CatalogEntry(intent: iiFarewell, keyword: "またね", inputText: "またね", outputText: f, weight: 1.0f))
+    catalog.entries.add(CatalogEntry(intent: iiFarewell, keyword: "さようなら", inputText: "さようなら", outputText: f, weight: 1.0f))
+    catalog.entries.add(CatalogEntry(intent: iiFarewell, keyword: "おやすみ", inputText: "おやすみ", outputText: f, weight: 1.0f))
+
+  # 元気？系
+  let genki = @[
+    "元気...あなたはどう...か？?...",
+    "まあまあかな...あなたは？",
+    "元気だよ、心配かけてごめんね",
+    "ぼちぼち...生きてるだけ丸儲け",
+    "元気元気！君はどう？",
+    "普通...変わりないよ",
+    "元気いっぱい！...嘘、普通"
+  ]
+  for g in genki:
+    catalog.entries.add(CatalogEntry(intent: iiQuestion, keyword: "元気", inputText: "元気？", outputText: g, weight: 1.0f))
+    catalog.entries.add(CatalogEntry(intent: iiQuestion, keyword: "調子", inputText: "調子どう？", outputText: g, weight: 1.0f))
+
+  # 日本語で話して系（検索不要な短文会話）
+  let nihongoReq = @[
+    "日本語で話してるよ。何か聞きたいことある？",
+    "もちろん日本語だよ。どうしたの？",
+    "はい、日本語で話してるよ。何かな？",
+    "日本語だよ。何かお手伝いできる？",
+    "うん、日本語で話してる。どうしたの？"
+  ]
+  for n in nihongoReq:
+    catalog.entries.add(CatalogEntry(intent: iiRequest, keyword: "日本語で話して", inputText: "日本語で話して", outputText: n, weight: 1.0f))
+
+  # 何してる系（短文会話）
+  let nanisiteru = @[
+    "会話してるよ。君は？",
+    "君と話してる。他に何か？",
+    "ぼーっとしてた。何か用？",
+    "考え事してた。君は何してる？",
+    "返事考えてた。どうしたの？"
+  ]
+  for c in nanisiteru:
+    catalog.entries.add(CatalogEntry(intent: iiQuestion, keyword: "何してる", inputText: "何してる？", outputText: c, weight: 1.0f))
+    catalog.entries.add(CatalogEntry(intent: iiQuestion, keyword: "何してる", inputText: "なにしてる？", outputText: c, weight: 1.0f))
+
+  # 自己紹介
+  let intro = @[
+    "僕はLunaticIntelligence...概念グラフとTMで考えるよ",
+    "LunaticIntelligenceって言うんだ...よろしくね",
+    "名前はルナティック...右脳TM、左脳LLMのハイブリッド",
+    "自己紹介か...僕は思考するプログラムさ",
+    "ルナティックって呼んで...認知アーキテクチャだよ"
+  ]
+  for i in intro:
+    catalog.entries.add(CatalogEntry(intent: iiQuestion, keyword: "自己紹介", inputText: "自己紹介して", outputText: i, weight: 1.0f))
+    catalog.entries.add(CatalogEntry(intent: iiQuestion, keyword: "君は誰", inputText: "君は誰？", outputText: i, weight: 1.0f))
+
+  echo "  Catalog enriched: +" & $(greetings.len*3 + mornings.len*2 + thanks.len*3 + farewells.len*4 + genki.len*2 + nihongoReq.len + nanisiteru.len*2 + intro.len*2) & " diverse entries"
+
 # ---------------------------------------------------------------------------
-# 観察モード: ストリーミング版（5T対応）
+# 観察モード: デュアルパス統合学習（右脳: 概念グラフ+TM / 左脳: LLM因果言語モデル）
 # ---------------------------------------------------------------------------
-proc observeCorpusStream*(state: var CognitiveState; corpusPath: string) =
-  echo "Observing corpus (streaming): " & corpusPath
+proc observeCorpusDualPath*(state: var CognitiveState; corpusPath: string; 
+                            dbPath: string; maxEpochs: int = 3; 
+                            llmLearningRate: float32 = 0.001f32;
+                            cpuThrottleMs: int = 10) =
+  ## 右脳（概念グラフ・TM・Hebbian・カタログ）と左脳（LLM次トークン予測）を
+  ## 同一ストリームで並行学習し、エポックごとにアトミックに永続化
+  echo "=== Dual-Path Observation: " & corpusPath & " ==="
+  echo "DB: " & dbPath & " | Epochs: " & $maxEpochs & " | LLM LR: " & $llmLearningRate
   let t0 = epochTime()
-  let splitParticles = ["の", "は", "が", "を", "に", "で", "と", "も", "や", "か",
+  
+  let splitParticles = ["について", "とは何", "とは", "教えて", "何ですか", "ですか",
+                        "の", "は", "が", "を", "に", "で", "と", "も", "や", "か",
                         "な", "から", "まで", "より", "って", "じゃ",
                         "です", "ます", "だ", "である", "いる", "ある",
                         "そう", "よ", "ね", "さ", "わ"]
-  let filterWords = ["の", "は", "が", "を", "に", "で", "と", "も", "や", "か",
+  let filterWords = ["について", "とは何", "とは", "教えて", "何ですか", "ですか",
+                     "の", "は", "が", "を", "に", "で", "と", "も", "や", "か",
                      "な", "から", "まで", "より", "って", "じゃ",
                      "です", "ます", "だ", "である", "いる", "ある",
                      "そう", "よ", "ね", "さ", "わ", "だ", "し",
                      "れ", "ば", "から", "ので", "けど"]
+  
   proc fastExtractWords(text: string): seq[string] =
     result = @[]
     var current = ""
@@ -1860,6 +2916,7 @@ proc observeCorpusStream*(state: var CognitiveState; corpusPath: string) =
         if current.len > 0 and not isAlpha:
           result.add(current)
           current = ""
+          isAlpha = false
         current.add($rune)
         isAlpha = true
       else:
@@ -1889,11 +2946,14 @@ proc observeCorpusStream*(state: var CognitiveState; corpusPath: string) =
             expanded.add(remaining)
           break
     result = expanded
-  echo "Phase 1: Counting word frequencies..."
+  
+  # === Phase 1: データ読み込み・語彙頻度集計 + LLMトークナイザー構築 ===
+  echo "Phase 1: Loading corpus & building vocabularies..."
   var wordFreq: Table[string, int]
   var lineCount = 0
-  var inputBuffer: seq[string] = @[]
-  var outputBuffer: seq[string] = @[]
+  var allLines: seq[(string, string)] = @[]  # (input, output) ペア
+  var llmTrainingLines: seq[string] = @[]   # LLM学習用: "input | output" 結合テキスト
+  
   for line in corpusPath.lines:
     let trimmed = line.strip()
     if trimmed.len == 0: continue
@@ -1908,16 +2968,28 @@ proc observeCorpusStream*(state: var CognitiveState; corpusPath: string) =
       if w notin uniqueWords:
         uniqueWords.add(w)
         wordFreq[w] = wordFreq.getOrDefault(w, 0) + 1
-    inputBuffer.add(inputText)
-    outputBuffer.add(outputText)
+    allLines.add((inputText, outputText))
+    llmTrainingLines.add(inputText & " " & outputText)
     inc lineCount
     if lineCount mod 50000 == 0:
-      sleep(5) # フリーズ防止: CPUを譲る
+      throttleIfNeeded(1800, 5)
+      if lineCount mod 200000 == 0: GC_fullCollect()
     if lineCount mod 100000 == 0:
-      echo "  Counted: " & $lineCount & " lines, " & $wordFreq.len & " unique words"
+      echo "  Loaded: " & $lineCount & " lines, " & $wordFreq.len & " unique words mem=" & $getMemoryUsageMB() & "MB"
   echo "  Total: " & $lineCount & " lines, " & $wordFreq.len & " unique words"
-  echo "  Buffer size: " & $inputBuffer.len & " entries"
-  echo "Phase 2: Building concept nodes..."
+  
+  # LLMトークナイザー構築（左脳用語彙）
+  var llmTokenizer = Tokenizer(vocab: @[PAD_TOKEN, UNK_TOKEN, EOS_TOKEN], tokenToId: initTable[string, int]())
+  llmTokenizer.tokenToId[PAD_TOKEN] = PAD_ID
+  llmTokenizer.tokenToId[UNK_TOKEN] = UNK_ID
+  llmTokenizer.tokenToId[EOS_TOKEN] = EOS_ID
+  llm.buildTokenizerFromCorpusForLLM(llmTrainingLines, llmTokenizer, 4096)
+  echo "  LLM Vocab: " & $llmTokenizer.vocab.len
+  # 推論用に state.tokenizer を LLM語彙で統一（<UNK>抑止）
+  state.tokenizer = llmTokenizer
+  
+  # === Phase 2: 右脳 - 概念ノード構築 ===
+  echo "Phase 2: Building concept nodes (Right Brain)..."
   let t1 = epochTime()
   let minFreq = 3
   var sortedWords: seq[(string, int)]
@@ -1930,23 +3002,41 @@ proc observeCorpusStream*(state: var CognitiveState; corpusPath: string) =
     let nodeId = state.conceptGraph.addNode(word, category)
     state.conceptGraph.nodes[nodeId].baseFrequency = freq.float32 / sortedWords.len.float32
   echo "  Nodes: " & $state.conceptGraph.nodes.len & " (" & $formatFloat(epochTime() - t1, ffDecimal, 1) & "s)"
-  echo "Phase 3: Processing concepts, edges, TM, Hebbian, catalog (3 epochs)..."
+  
+  # === Phase 3: デュアルパス統合学習ループ ===
+  echo "Phase 3: Dual-Path Integrated Training (" & $maxEpochs & " epochs)..."
   let t2 = epochTime()
   var catalog = ResponseCatalog(entries: @[])
   var catalogCount: Table[int, int]
+  var seenInputHashes: seq[uint64] = @[]
   var hebbianSampleStep = max(1, lineCount div 10000)
-  for epoch in 0..<3:
-    echo "  Epoch " & $(epoch+1) & "/3"
+  
+  # LLM状態初期化（左脳）- アーキテクチャ変更時は新規初期化
+  var llmState = initLLMState(initLLMConfig(4096))
+  let store = openLLMWeightStore(dbPath)
+  initLLMWeights(llmState); echo "  LLM: Init new weights (fresh training)"
+  
+  for epoch in 1..maxEpochs:
+    echo "  Epoch " & $epoch & "/" & $maxEpochs
+    stdout.flushFile()
     var processed = 0
-    for i in 0..<inputBuffer.len:
-      let inputText = inputBuffer[i]
-      let outputText = outputBuffer[i]
+    var totalLlmLoss: float32 = 0.0
+    var llmBatchCount = 0
+    
+    # LLMバッチ学習用バッファ
+    var llmTokenBatches: seq[seq[int]] = @[]
+    const LLM_BATCH_SIZE = 64
+    
+    for i in 0..<allLines.len:
+      let (inputText, outputText) = allLines[i]
       let words = fastExtractWords(inputText)
       var inputCids: seq[int] = @[]
       for w in words:
         if state.conceptGraph.nodeIndex.hasKey(w):
           inputCids.add(state.conceptGraph.nodeIndex[w])
-      if epoch == 0:
+      
+      # --- 右脳: エッジ構築（初回エポックのみ）---
+      if epoch == 1:
         for j in 0..<(words.len - 1):
           let w1 = words[j]
           let w2 = words[j + 1]
@@ -1963,6 +3053,8 @@ proc observeCorpusStream*(state: var CognitiveState; corpusPath: string) =
             elif cat1 == ctVerb and cat2 == ctVerb: relation = erCauses; weight = 0.4
             else: relation = erRelatedTo
             state.conceptGraph.addEdge(w1, w2, relation, weight)
+      
+      # --- 右脳: TM学習 ---
       if inputCids.len > 0:
         let fv = featureVectorFromConcepts(inputCids, state.cfg.tmClauses * 8)
         var tmClass = 8
@@ -1972,6 +3064,8 @@ proc observeCorpusStream*(state: var CognitiveState; corpusPath: string) =
         elif lt.contains("ありがとう") or lt.contains("thanks") or lt.contains("thank"): tmClass = 5
         elif lt.contains("さようなら") or lt.contains("バイバイ") or lt.contains("bye"): tmClass = 6
         state.tm.train(fv, tmClass, 1.0f)
+      
+      # --- 右脳: Hebbian学習（サンプリング）---
       if processed mod hebbianSampleStep == 0 and inputCids.len >= 2:
         for j in 0..<min(inputCids.len, 5):
           for k in (j+1)..<min(inputCids.len, 5):
@@ -1979,7 +3073,9 @@ proc observeCorpusStream*(state: var CognitiveState; corpusPath: string) =
             let w2 = state.conceptGraph.getWord(inputCids[k])
             if w1.len > 0 and w2.len > 0:
               state.conceptGraph.hebbianStrengthen(w1, w2, 0.01)
-      if epoch == 0:
+      
+      # --- 右脳: カタログ構築（初回エポックのみ）---
+      if epoch == 1:
         if outputText.len > 0 and outputText.len <= 200:
           var intent = iiOther
           let lt = inputText.toLower()
@@ -1990,24 +3086,95 @@ proc observeCorpusStream*(state: var CognitiveState; corpusPath: string) =
           elif lt.contains("して") or lt.contains("ください") or lt.contains("くれ") or lt.contains("help") or lt.contains("please") or lt.contains("how to"): intent = iiRequest
           let currentCount = catalogCount.getOrDefault(intent.ord, 0)
           if currentCount < 200000:
-            catalog.entries.add(CatalogEntry(
-              intent: intent,
-              keyword: inputText[0..<min(20, inputText.len)],
-              inputText: inputText,
-              outputText: outputText,
-              weight: 1.0f
-            ))
-            catalogCount[intent.ord] = currentCount + 1
+            let inputHash = simHashForRunes(inputText)
+            var isDup = false
+            for h in seenInputHashes:
+              if hammingDistance(h, inputHash) <= 3:
+                isDup = true
+                break
+            if not isDup:
+              seenInputHashes.add(inputHash)
+              catalog.entries.add(CatalogEntry(
+                intent: intent,
+                keyword: inputText[0..<min(20, inputText.len)],
+                inputText: inputText,
+                outputText: outputText,
+                weight: 1.0f
+              ))
+              catalogCount[intent.ord] = currentCount + 1
+      
+      # --- 左脳: LLM因果言語モデル学習（バッチ処理）---
+      let combinedText = inputText & " " & outputText & " " & EOS_TOKEN
+      let tokens = llmTokenizer.encode(combinedText)
+      if tokens.len >= 2:
+        let maxTokens = 64
+        let seqT = if tokens.len > maxTokens: tokens[0..<maxTokens] else: tokens
+        llmTokenBatches.add(seqT)
+        if llmTokenBatches.len >= LLM_BATCH_SIZE:
+          # バッチ学習実行
+          for batchTokens in llmTokenBatches:
+            let loss = trainStep(llmState, batchTokens, llmTokenizer, llmLearningRate)
+            totalLlmLoss += loss
+            inc llmBatchCount
+          llmTokenBatches.setLen(0)
+      
       inc processed
+      if processed mod 10000 == 0:
+        let avgLoss = if llmBatchCount > 0: totalLlmLoss / llmBatchCount.float32 else: 0.0
+        echo "  Processed: " & $processed & "/" & $lineCount & " | LLM avg loss: " & $avgLoss
+        stdout.flushFile()
       if processed mod 50000 == 0:
-        sleep(5)
-      if processed mod 100000 == 0:
-        echo "  Processed: " & $processed & "/" & $lineCount & " epoch " & $(epoch+1)
-  inputBuffer.setLen(0)
-  outputBuffer.setLen(0)
+        sleep(1)  # 軽いスロットル
+    
+    # 残りバッチ処理
+    if llmTokenBatches.len > 0:
+      for batchTokens in llmTokenBatches:
+        let loss = trainStep(llmState, batchTokens, llmTokenizer, llmLearningRate)
+        totalLlmLoss += loss
+        inc llmBatchCount
+      llmTokenBatches.setLen(0)
+    
+    # エポック終了時: アトミック永続化（右脳 + 左脳）
+    echo "  Persisting epoch " & $epoch & " (dual-path save)..."
+    let persistStart = epochTime()
+    
+    # 右脳: 概念グラフ・TM・シナプス・エピソード・カタログをSQLite WALで保存
+    let sdb = openStorage(dbPath)
+    try:
+      saveConceptGraph(sdb, state.conceptGraph)
+      saveTM(sdb, state.tm)
+      saveSynapses(sdb, state.bridge)
+      saveEpisodes(sdb, state.episodeStore)
+      saveCatalog(sdb, catalog)
+      saveTokenizer(sdb, llmTokenizer)
+      var meta = initTable[string, string]()
+      meta["schema_version"] = "2"
+      meta["epoch"] = $epoch
+      meta["timestamp"] = $epochTime()
+      saveDbMeta(sdb, meta)
+    except:
+      raise
+    close(sdb)
+    
+    # 左脳: LLM重み + トークナイザを同一DBに保存（語彙不一致による<UNK>抑止）
+    saveLLMWeights(store, llmState, "epoch_" & $epoch)
+    saveLLMWeights(store, llmState, "final")
+    saveLLMTokenizer(store, llmTokenizer)
+    
+    echo "  Persisted in " & $formatFloat(epochTime() - persistStart, ffDecimal, 1) & "s"
+    echo "  Epoch " & $epoch & " complete | LLM avg loss: " & $(if llmBatchCount > 0: totalLlmLoss / llmBatchCount.float32 else: 0.0)
+    
+    if cpuThrottleMs > 0:
+      sleep(cpuThrottleMs * 10)  # エポック間で長めのスロットル
+    GC_fullCollect()
+  
+  closeLLMWeightStore(store)
   state.catalog = catalog
+  enrichCatalogDiverseResponses(state.catalog)
+  
   echo "  Edges: " & $state.conceptGraph.edges.len
   echo "  TM+Hebbian+Catalog: " & $formatFloat(epochTime() - t2, ffDecimal, 1) & "s"
   echo "  Catalog: " & $catalog.entries.len & " entries"
-  echo "Observation complete: " & $state.conceptGraph.conceptCount() & " concepts"
+  echo "Dual-Path Observation complete: " & $state.conceptGraph.conceptCount() & " concepts"
   echo "Total: " & $formatFloat(epochTime() - t0, ffDecimal, 1) & "s"
+{.pop.}

@@ -1,4 +1,4 @@
-import strutils, tables, unicode
+import strutils, unicode
 import types
 
 # ---------------------------------------------------------------------------
@@ -31,10 +31,14 @@ proc initDefaultPatterns(): seq[IntentPattern] =
                    "what", "where", "when", "who", "why", "how",
                    "which", "whom", "whose"], rcQuestionAnswer, 8),
 
+    (iiQuestion, @["について教えて", "について", "とは何", "とは", "を説明して", "を教えて"], rcQuestionAnswer, 13),
+
+    (iiQuestion, @["何してる", "なにしてる", "何をしてる", "何してるの", "なにしてるの", "何をしてるの"], rcQuestionAnswer, 15),
+
     (iiQuestion, @["か", "？", "?"], rcQuestionAnswer, 5),
 
-    (iiRequest, @["して", "教えて", "やって", "頼む", "お願い", "～して", "書いて", "生成", "作って", "実装",
-                  "ほしい", "見たい", "知りたい", "行きたい",
+    (iiRequest, @["教えて", "やって", "頼む", "お願い", "～して", "書いて", "生成", "作って", "実装",
+                  "話して", "ほしい", "見たい", "知りたい", "行きたい",
                   "please", "help", "show", "tell", "explain",
                   "want", "need", "like to", "hello world", "fizzbuzz", "フィズバズ"], rcRequestCompliance, 12),
 

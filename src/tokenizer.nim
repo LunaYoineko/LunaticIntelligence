@@ -1,16 +1,10 @@
-import tables, unicode, strutils, sequtils, algorithm, heapqueue
+import tables, unicode, sequtils, algorithm
 import types
 
 # ---------------------------------------------------------------------------
 # BPE (Byte Pair Encoding) Tokenizer
 # ---------------------------------------------------------------------------
 # Character-levelから出発し、頻出ペアを反復的にマージして単語レベル词汇を構築
-
-type
-  Merge = object
-    left: string
-    right: string
-    freq: int
 
 proc buildTokenizer*(corpus: seq[string]; maxVocab: int = 4096): Tokenizer =
   # 単語ベース: コーパスから高頻度文字列を辞書として構築（BPE不要）

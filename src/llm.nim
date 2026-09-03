@@ -1,21 +1,12 @@
-import math, random, sequtils, algorithm, strutils, tables, os
+import math, random, sequtils, algorithm, strutils, tables, os, unicode, base64
 import types, tokenizer
 import device
 import zippy
 import db_connector/db_sqlite
+import times
 
-# optional high-perf libs (graceful fallback if not present)
-when (compiles do: import nimblas):
-  import nimblas
-  const hasNimblas = true
-else:
-  const hasNimblas = false
-
-when (compiles do: import nimsimd):
-  import nimsimd
-  const hasSimd = true
-else:
-  const hasSimd = false
+const hasNimblas = false
+const hasSimd = false
 
 # ---------------------------------------------------------------------------
 # Hybrid LLM: 簡易Transformer実装 (左脳) - CPU特化 / ファイル縮小 / VRAM動的利用
@@ -68,13 +59,13 @@ type
     db*: DbConn
 
 proc initLLMConfig*(vocabSize: int): LLMConfig =
-  # 32GB RAM活用: dModel 64/128, 2-3層でも量子化+CPU最適化で実用速度
+  # 32GB RAM活用: 小さくして高速化
   result.vocabSize = min(vocabSize, 4096)
-  result.dModel = 64
-  result.nHead = 4
+  result.dModel = 48
+  result.nHead = 3
   result.nLayer = 2
-  result.dFF = 256
-  result.maxSeqLen = 128
+  result.dFF = 192
+  result.maxSeqLen = 64
   result.dropout = 0.1
 
 proc xavierInit*(fanIn, fanOut: int): float32 =
@@ -97,7 +88,6 @@ proc estimateModelBytes*(cfg: LLMConfig): int64 =
 
 proc initLLMState*(config: LLMConfig): LLMState =
   result.config = config
-  let dev = getDeviceInfo()
   let bytes = estimateModelBytes(config)
   result.estimatedBytes = bytes
   # CPUメイン: 常駐はfalseでCPU保持、GPUは必要なときだけアシスト的に使用（バス転送最小化）
@@ -449,6 +439,313 @@ proc generateText*(state: var LLMState; tokenizer: Tokenizer; prompt: string;
     generated.add(nextToken)
     if nextToken == 2: break
   return tokenizer.decode(generated)
+
+# LLM重みストア（SQLite WAL・同一DB）
+type
+  LLMWeightStore* = object
+    db*: DbConn
+
+proc openLLMWeightStore*(dbPath: string): LLMWeightStore =
+  result.db = open(dbPath, "", "", "")
+  result.db.exec(sql"PRAGMA journal_mode=WAL")
+  result.db.exec(sql"PRAGMA synchronous=NORMAL")
+  result.db.exec(sql"PRAGMA cache_size=-64000")
+  result.db.exec(sql"PRAGMA temp_store=MEMORY")
+  result.db.exec(sql"PRAGMA wal_autocheckpoint=1000")
+  result.db.exec(sql"CREATE TABLE IF NOT EXISTS llm_weights (key TEXT PRIMARY KEY, value BLOB, updated_at INTEGER)")
+  result.db.exec(sql"CREATE TABLE IF NOT EXISTS llm_tokenizer (token TEXT PRIMARY KEY, token_id INTEGER)")
+
+proc closeLLMWeightStore*(store: LLMWeightStore) =
+  if store.db != nil: store.db.close()
+
+proc saveLLMTokenizer*(store: LLMWeightStore; tokenizer: Tokenizer) =
+  if store.db == nil: return
+  try:
+    store.db.exec(sql"BEGIN")
+    store.db.exec(sql"DELETE FROM llm_tokenizer")
+    for tok in tokenizer.vocab:
+      let id = tokenizer.tokenToId.getOrDefault(tok, -1)
+      if id >= 0:
+        store.db.exec(sql"INSERT OR REPLACE INTO llm_tokenizer VALUES (?, ?)", tok, id)
+    store.db.exec(sql"COMMIT")
+  except CatchableError as e:
+    try: store.db.exec(sql"ROLLBACK") except: discard
+    echo "  saveLLMTokenizer failed: " & e.msg
+
+proc loadLLMTokenizer*(store: LLMWeightStore; tokenizer: var Tokenizer): bool =
+  if store.db == nil: return false
+  try:
+    var vocab: seq[string] = @[]
+    var maxId = -1
+    var pairs: seq[(int, string)] = @[]
+    for row in store.db.fastRows(sql"SELECT token, token_id FROM llm_tokenizer"):
+      let tok = row[0]
+      let id = parseInt(row[1])
+      pairs.add((id, tok))
+      if id > maxId: maxId = id
+    if pairs.len == 0: return false
+    pairs.sort(proc(a,b:(int,string)):int = cmp(a[0], b[0]))
+    vocab = newSeq[string](maxId+1)
+    for (id, tok) in pairs:
+      if id >= 0 and id < vocab.len:
+        vocab[id] = tok
+    # 空スロットをPADで埋め
+    for i in 0..<vocab.len:
+      if vocab[i].len == 0:
+        vocab[i] = "<PAD>"
+    # PAD/UNK/EOS は保証
+    if vocab.len > 0: vocab[0] = PAD_TOKEN
+    if vocab.len > 1: vocab[1] = UNK_TOKEN
+    if vocab.len > 2: vocab[2] = EOS_TOKEN
+    tokenizer.vocab = vocab
+    tokenizer.tokenToId = initTable[string,int]()
+    for i, tok in vocab:
+      tokenizer.tokenToId[tok] = i
+    return true
+  except:
+    return false
+
+proc initLLMWeights*(state: var LLMState) =
+  let cfg = state.config
+  state.tokenEmb = newSeq[float32](cfg.vocabSize * cfg.dModel)
+  state.posEmb = newSeq[float32](cfg.maxSeqLen * cfg.dModel)
+  state.lnFinalWeight = newSeq[float32](cfg.dModel)
+  state.lnFinalBias = newSeq[float32](cfg.dModel)
+  state.outWeight = newSeq[float32](cfg.vocabSize * cfg.dModel)
+  for i in 0..<state.tokenEmb.len: state.tokenEmb[i] = (rand(1.0f32)-0.5)*0.02
+  for i in 0..<state.posEmb.len: state.posEmb[i] = (rand(1.0f32)-0.5)*0.02
+  for i in 0..<cfg.dModel:
+    state.lnFinalWeight[i] = 1.0; state.lnFinalBias[i] = 0.0
+  for i in 0..<state.outWeight.len: state.outWeight[i] = (rand(1.0f32)-0.5)*0.02
+  state.layers = newSeq[TransformerLayer](cfg.nLayer)
+  for l in 0..<cfg.nLayer:
+    let layer = addr state.layers[l]
+    layer.ln1Weight = newSeq[float32](cfg.dModel); layer.ln1Bias = newSeq[float32](cfg.dModel)
+    layer.qkvWeight = newSeq[float32](3*cfg.dModel*cfg.dModel); layer.qkvBias = newSeq[float32](3*cfg.dModel)
+    layer.attnOutWeight = newSeq[float32](cfg.dModel*cfg.dModel); layer.attnOutBias = newSeq[float32](cfg.dModel)
+    layer.ln2Weight = newSeq[float32](cfg.dModel); layer.ln2Bias = newSeq[float32](cfg.dModel)
+    layer.ffn1Weight = newSeq[float32](cfg.dFF*cfg.dModel); layer.ffn1Bias = newSeq[float32](cfg.dFF)
+    layer.ffn2Weight = newSeq[float32](cfg.dModel*cfg.dFF); layer.ffn2Bias = newSeq[float32](cfg.dModel)
+    for i in 0..<cfg.dModel: layer.ln1Weight[i]=1.0; layer.ln1Bias[i]=0.0; layer.ln2Weight[i]=1.0; layer.ln2Bias[i]=0.0
+    for i in 0..<layer.qkvWeight.len: layer.qkvWeight[i]=(rand(1.0f32)-0.5)*0.02
+    for i in 0..<layer.attnOutWeight.len: layer.attnOutWeight[i]=(rand(1.0f32)-0.5)*0.02
+    for i in 0..<layer.ffn1Weight.len: layer.ffn1Weight[i]=(rand(1.0f32)-0.5)*0.02
+    for i in 0..<layer.ffn2Weight.len: layer.ffn2Weight[i]=(rand(1.0f32)-0.5)*0.02
+
+proc loadTrainingDataForLLM(path: string): seq[string] =
+  result = @[]
+  if not fileExists(path): return
+  var count=0
+  for line in path.lines:
+    if count>200000: break # メモリ抑制: 最大20万行まで
+    let t=line.strip()
+    if t.len==0: continue
+    let p=t.find('|')
+    if p>=0:
+      let a=t[0..<p].strip(); let b=t[p+1..^1].strip()
+      if a.len>0 and b.len>0: result.add(a & "|" & b); inc count
+
+proc buildTokenizerFromCorpusForLLM*(corpus: seq[string]; tokenizer: var Tokenizer; maxVocab: int = 4096) =
+  var wf: Table[string,int]
+  for text in corpus:
+    var cur=""; var isAlpha=false
+    for rune in text.toRunes:
+      let cp=rune.int32
+      if (cp>=0x3040 and cp<=0x309F) or (cp>=0x30A0 and cp<=0x30FF) or (cp>=0x4E00 and cp<=0x9FFF):
+        if cur.len>0 and isAlpha: wf[cur]=wf.getOrDefault(cur,0)+1; cur=""; isAlpha=false
+        cur.add($rune)
+      elif (cp>=0x0041 and cp<=0x005A) or (cp>=0x0061 and cp<=0x007A) or (cp>=0x0030 and cp<=0x0039) or cp==0x005F:
+        if cur.len>0 and not isAlpha: wf[cur]=wf.getOrDefault(cur,0)+1; cur=""
+        cur.add($rune); isAlpha=true
+      else:
+        if cur.len>0: wf[cur]=wf.getOrDefault(cur,0)+1; cur=""; isAlpha=false
+    if cur.len>0: wf[cur]=wf.getOrDefault(cur,0)+1
+  var sorted=toSeq(wf.pairs); sorted.sort(proc(a,b:(string,int)):int=cmp(b[1],a[1]))
+  var idx=3
+  for (w,_) in sorted:
+    if idx>=maxVocab: break
+    if w.len>0 and not tokenizer.tokenToId.hasKey(w):
+      tokenizer.vocab.add(w); tokenizer.tokenToId[w]=idx; inc idx
+
+proc trainStep*(state: var LLMState; tokens: seq[int]; tokenizer: Tokenizer; learningRate: float32=0.001f32): float32 =
+  if tokens.len<2: return 0.0
+  let cfg = state.config
+  let seqT = tokens[0..^2]
+  let target = tokens[^1]
+  if target<0 or target>=cfg.vocabSize: return 8.0
+  # Forward: 最終位置の隠れ状態を取得するため、transformerForwardを呼び出しつつ最終層手前を再計算
+  let logits = transformerForward(state, seqT, newSeq[float32](cfg.dModel))
+  # Softmax & loss
+  var maxLogit = logits[0]
+  for v in logits:
+    if v>maxLogit: maxLogit=v
+  var sumExp: float32 = 0.0
+  for v in logits: sumExp += exp(v - maxLogit)
+  var probs = newSeq[float32](logits.len)
+  for i in 0..<logits.len: probs[i] = exp(logits[i]-maxLogit)/sumExp
+  let p = probs[target]
+  let loss = -ln(p + 1e-8)
+  # Backward (SGD): 出力層とトークン埋め込みのみを更新（軽量で5T対応、2GBでも動作）
+  let lr = learningRate
+  # dLogits = p - 1 for target
+  var dLogits = probs
+  dLogits[target] -= 1.0
+  # 最終隠れ状態を再取得（簡易: 最後のトークンの位置の正規化後ベクトルを再計算）
+  # 簡易近似: posEmb + tokenEmb を隠れ状態とみなす（完全なFFN逆伝播は省略し出力層のみで学習効果を担保）
+  let lastPos = seqT.len - 1
+  var hidden = newSeq[float32](cfg.dModel)
+  if lastPos >= 0 and seqT[lastPos] >= 0 and seqT[lastPos] < cfg.vocabSize:
+    for i in 0..<cfg.dModel:
+      hidden[i] = state.tokenEmb[seqT[lastPos]*cfg.dModel + i] + state.posEmb[lastPos*cfg.dModel + i]
+      # lnFinalを簡易逆伝播（gammaで割る）
+      if state.lnFinalWeight[i] != 0:
+        hidden[i] = hidden[i] / max(0.1f, abs(state.lnFinalWeight[i]))
+  # 出力重み更新: outWeight[target] -= lr * d * hidden
+  for i in 0..<cfg.dModel:
+    let grad = dLogits[target] * hidden[i]
+    state.outWeight[target*cfg.dModel + i] -= lr * grad
+    # 正則化で発散防止
+    if state.outWeight[target*cfg.dModel + i] > 1.0:
+      state.outWeight[target*cfg.dModel + i] = 1.0
+    if state.outWeight[target*cfg.dModel + i] < -1.0:
+      state.outWeight[target*cfg.dModel + i] = -1.0
+  # 負例（他トークン）は小さく押し下げ（topKのみで高速化）
+  var topK = min(16, logits.len)
+  var idxs = newSeq[int](logits.len)
+  for i in 0..<logits.len: idxs[i]=i
+  # 簡易topK: 確率高い順の上位16のみを負例更新
+  for k in 0..<topK:
+    var bestIdx = -1; var bestProb: float32 = -1.0
+    for i in 0..<logits.len:
+      if probs[i] > bestProb and i != target:
+        var used=false
+        for j in 0..<k:
+          if idxs[j]==i: used=true
+        if not used:
+          bestProb=probs[i]; bestIdx=i
+    if bestIdx>=0 and probs[bestIdx] > 0.01:
+      for i in 0..<cfg.dModel:
+        state.outWeight[bestIdx*cfg.dModel + i] -= lr * 0.1 * probs[bestIdx] * hidden[i] * 0.1
+  # トークン埋め込みも微更新
+  if lastPos >= 0 and seqT[lastPos] >= 0 and seqT[lastPos] < cfg.vocabSize:
+    for i in 0..<cfg.dModel:
+      state.tokenEmb[seqT[lastPos]*cfg.dModel + i] -= lr * 0.5 * dLogits[target] * hidden[i] * 0.01
+  return loss
+
+proc saveLLMWeights*(store: LLMWeightStore; state: LLMState; prefix: string="") =
+  if store.db==nil: return
+  try:
+    store.db.exec(sql"BEGIN")
+    let cfg=state.config
+    store.db.exec(sql"INSERT OR REPLACE INTO llm_weights VALUES (?,?,?)", prefix & "_config", $cfg.vocabSize & "," & $cfg.dModel & "," & $cfg.nLayer & "," & $cfg.dFF & "," & $cfg.maxSeqLen, epochTime().int)
+    proc saveArray(key:string; data:openArray[float32]) =
+      let qw=quantizeF32(data); var blob=""; blob.add($qw.scale & "\n")
+      for b in qw.q: blob.add(chr(cast[uint8](b)))
+      let comp=zippy.compress(blob, level=6)
+      let b64=base64.encode(comp)
+      store.db.exec(sql"INSERT OR REPLACE INTO llm_weights VALUES (?,?,?)", prefix & "_" & key, b64, epochTime().int)
+    saveArray("tokenEmb", state.tokenEmb); saveArray("posEmb", state.posEmb)
+    saveArray("lnFinalW", state.lnFinalWeight); saveArray("lnFinalB", state.lnFinalBias); saveArray("outW", state.outWeight)
+    for l in 0..<cfg.nLayer:
+      let layer=state.layers[l]
+      saveArray("l" & $l & "_ln1W", layer.ln1Weight); saveArray("l" & $l & "_ln1B", layer.ln1Bias)
+      saveArray("l" & $l & "_qkvW", layer.qkvWeight); saveArray("l" & $l & "_qkvB", layer.qkvBias)
+      saveArray("l" & $l & "_attnOutW", layer.attnOutWeight); saveArray("l" & $l & "_attnOutB", layer.attnOutBias)
+      saveArray("l" & $l & "_ln2W", layer.ln2Weight); saveArray("l" & $l & "_ln2B", layer.ln2Bias)
+      saveArray("l" & $l & "_ffn1W", layer.ffn1Weight); saveArray("l" & $l & "_ffn1B", layer.ffn1Bias)
+      saveArray("l" & $l & "_ffn2W", layer.ffn2Weight); saveArray("l" & $l & "_ffn2B", layer.ffn2Bias)
+    store.db.exec(sql"COMMIT")
+    echo "  Saved LLM weights (" & prefix & ")"
+  except CatchableError as e:
+    try: store.db.exec(sql"ROLLBACK") except: discard
+    echo "  Save failed: " & e.msg
+
+proc loadLLMWeights*(store: LLMWeightStore; state: var LLMState; prefix: string=""): bool =
+  if store.db==nil: return false
+  try:
+    var cfgLoaded=false
+    for row in store.db.fastRows(sql"SELECT value FROM llm_weights WHERE key=?", prefix & "_config"):
+      let parts=row[0].split(",")
+      if parts.len>=5:
+        state.config.vocabSize=parseInt(parts[0]); state.config.dModel=parseInt(parts[1])
+        state.config.nLayer=parseInt(parts[2]); state.config.dFF=parseInt(parts[3]); state.config.maxSeqLen=parseInt(parts[4]); cfgLoaded=true
+    if not cfgLoaded: return false
+    let cfg=state.config
+    state.tokenEmb=newSeq[float32](cfg.vocabSize*cfg.dModel); state.posEmb=newSeq[float32](cfg.maxSeqLen*cfg.dModel)
+    state.lnFinalWeight=newSeq[float32](cfg.dModel); state.lnFinalBias=newSeq[float32](cfg.dModel); state.outWeight=newSeq[float32](cfg.vocabSize*cfg.dModel)
+    state.layers=newSeq[TransformerLayer](cfg.nLayer)
+    for l in 0..<cfg.nLayer:
+      state.layers[l].ln1Weight=newSeq[float32](cfg.dModel); state.layers[l].ln1Bias=newSeq[float32](cfg.dModel)
+      state.layers[l].qkvWeight=newSeq[float32](3*cfg.dModel*cfg.dModel); state.layers[l].qkvBias=newSeq[float32](3*cfg.dModel)
+      state.layers[l].attnOutWeight=newSeq[float32](cfg.dModel*cfg.dModel); state.layers[l].attnOutBias=newSeq[float32](cfg.dModel)
+      state.layers[l].ln2Weight=newSeq[float32](cfg.dModel); state.layers[l].ln2Bias=newSeq[float32](cfg.dModel)
+      state.layers[l].ffn1Weight=newSeq[float32](cfg.dFF*cfg.dModel); state.layers[l].ffn1Bias=newSeq[float32](cfg.dFF)
+      state.layers[l].ffn2Weight=newSeq[float32](cfg.dModel*cfg.dFF); state.layers[l].ffn2Bias=newSeq[float32](cfg.dModel)
+    proc loadArray(key:string; data:var openArray[float32]): bool =
+      var found=false
+      for row in store.db.fastRows(sql"SELECT value FROM llm_weights WHERE key=?", prefix & "_" & key):
+        let b64=row[0]; let comp=base64.decode(b64); let blob=zippy.uncompress(comp)
+        let lines=blob.splitLines()
+        if lines.len>=2:
+          let scale=parseFloat(lines[0]); let bytes=lines[1]
+          for i in 0..<min(bytes.len, data.len): data[i]=cast[int8](bytes[i].ord).float32*scale
+          found=true
+      return found
+    discard loadArray("tokenEmb", state.tokenEmb); discard loadArray("posEmb", state.posEmb)
+    discard loadArray("lnFinalW", state.lnFinalWeight); discard loadArray("lnFinalB", state.lnFinalBias); discard loadArray("outW", state.outWeight)
+    for l in 0..<cfg.nLayer:
+      discard loadArray("l" & $l & "_ln1W", state.layers[l].ln1Weight); discard loadArray("l" & $l & "_ln1B", state.layers[l].ln1Bias)
+      discard loadArray("l" & $l & "_qkvW", state.layers[l].qkvWeight); discard loadArray("l" & $l & "_qkvB", state.layers[l].qkvBias)
+      discard loadArray("l" & $l & "_attnOutW", state.layers[l].attnOutWeight); discard loadArray("l" & $l & "_attnOutB", state.layers[l].attnOutBias)
+      discard loadArray("l" & $l & "_ln2W", state.layers[l].ln2Weight); discard loadArray("l" & $l & "_ln2B", state.layers[l].ln2Bias)
+      discard loadArray("l" & $l & "_ffn1W", state.layers[l].ffn1Weight); discard loadArray("l" & $l & "_ffn1B", state.layers[l].ffn1Bias)
+      discard loadArray("l" & $l & "_ffn2W", state.layers[l].ffn2Weight); discard loadArray("l" & $l & "_ffn2B", state.layers[l].ffn2Bias)
+    echo "  Loaded LLM weights (" & prefix & ")"; return true
+  except: return false
+
+# LLM学習（CPU/メモリ抑制・同一DB）
+proc trainLLM*(corpusPath: string; dbPath: string; maxEpochs: int=3; maxTokens: int=128; batchSize: int=32; cpuThrottleMs: int=10) =
+  echo "=== LLM Training (throttled, same DB) ==="
+  echo "Corpus: " & corpusPath & " DB: " & dbPath & " epochs=" & $maxEpochs & " batch=" & $batchSize & " throttle=" & $cpuThrottleMs & "ms"
+  let lines=loadTrainingDataForLLM(corpusPath)
+  if lines.len==0: echo "No data"; return
+  echo "Lines: " & $lines.len
+  let store=openLLMWeightStore(dbPath)
+  var state=initLLMState(initLLMConfig(4096))
+  if not loadLLMWeights(store, state, "final"):
+    if not loadLLMWeights(store, state, "epoch_1"): initLLMWeights(state); echo "Init new weights"
+    else: echo "Resumed"
+  var tok=Tokenizer(vocab: @[PAD_TOKEN, UNK_TOKEN, EOS_TOKEN], tokenToId:initTable[string,int]())
+  tok.tokenToId[PAD_TOKEN]=PAD_ID; tok.tokenToId[UNK_TOKEN]=UNK_ID; tok.tokenToId[EOS_TOKEN]=EOS_ID
+  buildTokenizerFromCorpusForLLM(lines, tok, 4096)
+  echo "Vocab: " & $tok.vocab.len
+  let batches=(lines.len+batchSize-1) div batchSize
+  for epoch in 1..maxEpochs:
+    echo "Epoch " & $epoch & "/" & $maxEpochs
+    var totalLoss:float32=0; var cnt=0
+    for i in countup(0, lines.len-1, batchSize):
+      let e=min(i+batchSize, lines.len)
+      var bLoss:float32=0; var bCnt=0
+      for j in i..<e:
+        let p=lines[j].find('|'); if p<0: continue
+        let a=lines[j][0..<p].strip(); let b=lines[j][p+1..^1].strip()
+        if a.len==0 or b.len==0: continue
+        let toks=tok.encode(a & " " & b & " " & EOS_TOKEN)
+        if toks.len<2: continue
+        let seqT=if toks.len>maxTokens: toks[0..<maxTokens] else: toks
+        bLoss+=trainStep(state, seqT, tok, 0.001f32); inc bCnt
+      if bCnt>0:
+        totalLoss+=bLoss/bCnt.float32; inc cnt
+        if cnt mod 50==0: echo "  batch " & $cnt & "/" & $batches & " loss=" & $(totalLoss/cnt.float32)
+      if cpuThrottleMs>0: sleep(cpuThrottleMs)
+      # メモリ抑制: GC
+      if cnt mod 200==0: GC_fullCollect()
+    echo "Epoch " & $epoch & " avg loss " & $(totalLoss/max(1,cnt).float32)
+    saveLLMWeights(store, state, "epoch_" & $epoch)
+    saveLLMWeights(store, state, "final")
+    GC_fullCollect()
+  closeLLMWeightStore(store)
+  echo "Done. DB=" & dbPath & " (single file, WAL)"
 
 # SQLite WALストア操作（LMDBから移行: WALで凍結回避、軽量）
 proc openLMDBStore*(path: string; mapSize: int64 = 1_000_000_000): LMDBStore =

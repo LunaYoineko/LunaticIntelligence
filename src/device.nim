@@ -1,4 +1,4 @@
-import os, strutils, osproc, tables
+import strutils, osproc
 
 type
   ComputeDevice* = enum
@@ -12,7 +12,7 @@ type
     hasGPU*: bool
     busWidth*: int       # for transfer cost estimation
 
-proc parseMemValue(s: string): int64 =
+proc parseMemValue(s: string): int64 {.used.} =
   let t = s.strip()
   if t.endsWith("MiB"):
     return parseInt(t[0..^4].strip()) * 1024 * 1024

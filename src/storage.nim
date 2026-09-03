@@ -1,21 +1,37 @@
-import db_connector/db_sqlite, strutils, sequtils, algorithm, math, tables, times
-import types, tokenizer, tsetlin, concept_graph, working_memory
+import db_connector/db_sqlite, strutils, math, tables, times
+import types, concept_graph, working_memory
 
 type
   StorageDB* = object
     db*: DbConn
 
+proc optimizeStorageFor5T*(sdb: StorageDB) =
+  try:
+    sdb.db.exec(sql"PRAGMA incremental_vacuum(500)")
+    sdb.db.exec(sql"PRAGMA wal_checkpoint(TRUNCATE)")
+  except: discard
+
 proc openStorage*(path: string): StorageDB =
   result.db = open(path, "", "", "")
+  # 5T対応・この環境(2GB/2CPU)でも動作: WAL + 小キャッシュ + メモリ一時 + 自動VACUUM
   result.db.exec(sql"PRAGMA journal_mode=WAL")
+  result.db.exec(sql"PRAGMA synchronous=NORMAL")
+  result.db.exec(sql"PRAGMA cache_size=-64000")  # 64MB
+  result.db.exec(sql"PRAGMA temp_store=MEMORY")
+  result.db.exec(sql"PRAGMA mmap_size=67108864") # 64MB mmap (2GB環境で抑制)
+  result.db.exec(sql"PRAGMA auto_vacuum=INCREMENTAL")
+  result.db.exec(sql"PRAGMA wal_autocheckpoint=500")
+  result.db.exec(sql"PRAGMA journal_size_limit=33554432") # 32MB
   result.db.exec(sql"CREATE TABLE IF NOT EXISTS model_config (key TEXT PRIMARY KEY, value TEXT)")
   result.db.exec(sql"CREATE TABLE IF NOT EXISTS tokenizer_vocab (id INTEGER, token TEXT)")
   result.db.exec(sql"CREATE TABLE IF NOT EXISTS concept_nodes (id INTEGER PRIMARY KEY, word TEXT, category INTEGER, base_frequency REAL, access_count INTEGER)")
   result.db.exec(sql"CREATE TABLE IF NOT EXISTS concept_edges (from_id INTEGER, to_id INTEGER, relation INTEGER, weight REAL, hebbian_count INTEGER)")
   result.db.exec(sql"CREATE TABLE IF NOT EXISTS tm_states (layer_idx INTEGER, clause_idx INTEGER, states BLOB)")
   result.db.exec(sql"CREATE TABLE IF NOT EXISTS synapses (clause_id INTEGER, concept_id INTEGER, strength REAL, activation_count INTEGER, last_activated REAL, half_life_days REAL)")
+  result.db.exec(sql"CREATE TABLE IF NOT EXISTS episodes (input_text TEXT, output_text TEXT, input_concept_ids TEXT, output_concept_ids TEXT, tm_clause_pattern TEXT, confidence REAL, speaker INTEGER, context_tag TEXT, situation TEXT, timestamp REAL, reward REAL, rank_val REAL, access_count INTEGER, emotional_valence REAL)")
   result.db.exec(sql"CREATE TABLE IF NOT EXISTS response_catalog (intent INTEGER, keyword TEXT, input_text TEXT, output_text TEXT, weight REAL)")
   result.db.exec(sql"CREATE TABLE IF NOT EXISTS working_memory_items (concept_id INTEGER, activation REAL, source TEXT)")
+  result.db.exec(sql"CREATE TABLE IF NOT EXISTS db_meta (key TEXT PRIMARY KEY, value TEXT)")
 
 proc close*(sdb: StorageDB) =
   sdb.db.close()
@@ -123,7 +139,6 @@ proc saveConceptGraph*(sdb: StorageDB; graph: ConceptGraph) =
 proc loadConceptGraph*(sdb: StorageDB): ConceptGraph =
   result = initConceptGraph()
   for row in sdb.db.fastRows(sql"SELECT id, word, category, base_frequency, access_count FROM concept_nodes"):
-    let id = parseInt(row[0])
     let word = row[1]
     let cat = ConceptType(parseInt(row[2]))
     let freq = parseFloat(row[3])
@@ -174,7 +189,6 @@ proc saveTM*(sdb: StorageDB; tm: HierarchicalTM) =
 proc loadTM*(sdb: StorageDB; tm: var HierarchicalTM) =
   var chunks: Table[int, seq[string]] = initTable[int, seq[string]]()
   var hasChunked = false
-  var hasLegacy = false
   for row in sdb.db.fastRows(sql"SELECT layer_idx, clause_idx, states FROM tm_states"):
     let li = parseInt(row[0])
     let chunkIdx = if row.len > 2: parseInt(row[1]) else: 0
@@ -320,6 +334,17 @@ proc saveCatalog*(sdb: StorageDB; catalog: ResponseCatalog) =
     sdb.db.exec(sql"INSERT INTO response_catalog VALUES (?, ?, ?, ?, ?)",
       entry.intent.ord, entry.keyword, entry.inputText, entry.outputText, entry.weight)
   sdb.db.exec(sql"COMMIT")
+
+proc saveDbMeta*(sdb: StorageDB; meta: Table[string,string]) =
+  for k, v in meta.pairs:
+    sdb.db.exec(sql"INSERT OR REPLACE INTO db_meta VALUES (?, ?)", k, v)
+
+proc loadDbMeta*(sdb: StorageDB): Table[string,string] =
+  result = initTable[string,string]()
+  try:
+    for row in sdb.db.fastRows(sql"SELECT key, value FROM db_meta"):
+      result[row[0]] = row[1]
+  except: discard
 
 proc loadCatalog*(sdb: StorageDB): ResponseCatalog =
   result = ResponseCatalog(entries: @[])

@@ -53,3 +53,13 @@ test_search7
 test_search9
 test_search_debug
 test_wiki_jp
+knowledge
+src/mcp_server
+src/server
+lunatic_chat.db-shm
+lunatic_chat.db-wal
+lunatic_chat.db.ultra
+lunatic_cognitive.db.ultra
+lunatic_nim.db.ultra
+observe.log
+corpus_custom

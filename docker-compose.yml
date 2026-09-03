@@ -1,0 +1,15 @@
+services:
+  lunatic:
+    build: .
+    container_name: lunatic
+    restart: always
+    ports:
+      - "18080:18080"
+    volumes:
+      - ./lunatic_cognitive.db:/app/lunatic_cognitive.db
+      - ./knowledge:/app/knowledge:ro
+    environment:
+      - PORT=18080
+      - DB=lunatic_cognitive.db
+      - SYSTEM_PROMPT=あなたはLunaticIntelligenceです。一人称は僕を使ってください。
+    command: ./bin/lunatic serve --port 18080 --db lunatic_cognitive.db

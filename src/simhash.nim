@@ -1,4 +1,4 @@
-import std/hashes, strutils, sequtils, math, unicode, tables
+import std/hashes, strutils, math, unicode, tables
 
 # ---------------------------------------------------------------------------
 # SimHash: 単語の類似比較をハミング距離で高速に行う

@@ -1,4 +1,4 @@
-import random, math, sequtils, strutils, tables
+import random, math, strutils
 import types
 
 proc initTsetlinLayer*(numFeatures, numClauses: int;

@@ -1,4 +1,4 @@
-import httpclient, strutils, json, os, sequtils, uri, unicode, tables, times, asyncdispatch
+import httpclient, strutils, json, os, uri, unicode, tables, asyncdispatch
 
 # ASCII文字のみか判定
 proc isAsciiOnly*(s: string): bool =
@@ -48,7 +48,7 @@ proc initWebSearcher*(cacheDir: string = "/tmp/lunatic_cache"): WebSearcher =
   if not dirExists(cacheDir):
     createDir(cacheDir)
 
-proc search*(ws: var WebSearcher; query: string; maxResults: int = 3): seq[SearchResult] =
+proc search*(ws: var WebSearcher; query: string; maxResults: int = 10): seq[SearchResult] =
   result = @[]
 
   # キャッシュ確認
@@ -101,7 +101,7 @@ proc search*(ws: var WebSearcher; query: string; maxResults: int = 3): seq[Searc
   client.headers = newHttpHeaders([("User-Agent", "LunaticIntelligence/1.0")])
   try:
     # 1. Wikipedia検索API（より関連性の高い結果） - 日本語Wikipediaを優先
-    let wikiSearchUrl = "https://ja.wikipedia.org/w/api.php?action=query&list=search&srsearch=" & encodeUrl(cleanQuery) & "&format=json&srprop=snippet&srlimit=3&srinfo=totalhits&srnamespace=0&srwhat=text"
+    let wikiSearchUrl = "https://ja.wikipedia.org/w/api.php?action=query&list=search&srsearch=" & encodeUrl(cleanQuery) & "&format=json&srprop=snippet&srlimit=10&srinfo=totalhits&srnamespace=0&srwhat=text"
     let wikiSearchResponse = client.getWithRetry(wikiSearchUrl)
     let wikiSearchData = parseJson(wikiSearchResponse)
 
@@ -110,7 +110,6 @@ proc search*(ws: var WebSearcher; query: string; maxResults: int = 3): seq[Searc
       for searchResult in searchResults:
         if result.len >= maxResults: break
         if searchResult.hasKey("title"):
-          let wikiTitle = searchResult["title"].getStr()
           # 検索結果のスニペットを優先使用（日本語の場合）
           let searchSnippet = if searchResult.hasKey("snippet"): searchResult["snippet"].getStr() else: ""
           # 日本語のスニペットがある場合はそれを優先使用
@@ -164,7 +163,7 @@ proc search*(ws: var WebSearcher; query: string; maxResults: int = 3): seq[Searc
     if ws.cache.len > 100:
       ws.cache = ws.cache[90..^1]
 
-proc searchParallel*(ws: var WebSearcher; query: string; maxResults: int = 3): seq[SearchResult] =
+proc searchParallel*(ws: var WebSearcher; query: string; maxResults: int = 10): seq[SearchResult] =
   ## 並列検索: WikipediaとDuckDuckGoを同時に取得
   result = @[]
   # キャッシュ確認
@@ -183,7 +182,7 @@ proc searchParallel*(ws: var WebSearcher; query: string; maxResults: int = 3): s
         cleanQuery = cleanQuery.replace(p, "")
       cleanQuery = cleanQuery.strip()
       if cleanQuery.len == 0: cleanQuery = query
-      let wikiSearchUrl = "https://ja.wikipedia.org/w/api.php?action=query&list=search&srsearch=" & encodeUrl(cleanQuery) & "&format=json&srprop=snippet&srlimit=3"
+      let wikiSearchUrl = "https://ja.wikipedia.org/w/api.php?action=query&list=search&srsearch=" & encodeUrl(cleanQuery) & "&format=json&srprop=snippet&srlimit=10"
       let resp = await client.getContent(wikiSearchUrl)
       let data = parseJson(resp)
       if data.hasKey("query") and data["query"].hasKey("search"):
@@ -261,10 +260,10 @@ proc searchParallel*(ws: var WebSearcher; query: string; maxResults: int = 3): s
       ws.cache = ws.cache[90..^1]
 
 proc getKnowledge*(ws: var WebSearcher; query: string): string =
-  let results = ws.searchParallel(query, 3)
+  let results = ws.searchParallel(query, 10)
   if results.len == 0:
     # フォールバックで逐次も試す
-    let res2 = ws.search(query, 3)
+    let res2 = ws.search(query, 10)
     if res2.len == 0: return ""
     var knowledge = ""
     for r in res2:
@@ -379,7 +378,7 @@ proc calculateExpression*(expr: string): string =
     
     # eval は危険なので、簡単なパーサーを使用
     # ここでは単純な四則演算のみサポート
-    var result = 0.0
+    var calcResult = 0.0
     var currentNum = 0.0
     var op = '+'
     var i = 0
@@ -391,12 +390,12 @@ proc calculateExpression*(expr: string): string =
           inc(i)
         currentNum = parseFloat(numStr)
         case op:
-        of '+': result += currentNum
-        of '-': result -= currentNum
-        of '*': result *= currentNum
-        of '/': 
+        of '+': calcResult += currentNum
+        of '-': calcResult -= currentNum
+        of '*': calcResult *= currentNum
+        of '/':
            if currentNum != 0.0:
-            result /= currentNum
+            calcResult /= currentNum
            else:
             return "0で割ることはできません"
         else: discard
@@ -405,6 +404,6 @@ proc calculateExpression*(expr: string): string =
         inc(i)
       else:
         inc(i)
-    return "結果: " & $formatFloat(result, ffDecimal, 2)
+    return "結果: " & $formatFloat(calcResult, ffDecimal, 2)
   except CatchableError:
     return "計算できませんでした"
